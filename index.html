@@ -1,0 +1,3862 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notez - Offline Note Taking</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    
+    <!-- PWA Manifest -->
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#2196F3">
+    
+    <!-- Standard favicon -->
+    <link rel="icon" href="favicon.ico" type="image/x-icon">
+    
+    <!-- iOS Safari optimizations -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="Notez">
+    <link rel="apple-touch-icon" href="apple-touch-icon.png">
+    
+    <!-- Android Chrome optimizations -->
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="application-name" content="Notez">
+    
+    <!-- Security headers -->
+    <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net;
+    style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net;
+    connect-src 'self' https://api.github.com;
+    img-src 'self' data: https:;
+    frame-src 'none';
+    object-src 'none';">
+    <meta http-equiv="X-Content-Type-Options" content="nosniff">
+    <meta http-equiv="X-Frame-Options" content="DENY">
+    <meta http-equiv="X-XSS-Protection" content="1; mode=block">
+    <meta http-equiv="Referrer-Policy" content="strict-origin-when-cross-origin">
+</head>
+
+<body>
+    <div id="app"></div>
+    <script src="main.js"></script>
+    <script>
+        // IndexedDB setup
+        let db;
+        const DB_NAME = 'NotezDB';
+        const DB_VERSION = 2; // Incremented for GitHub config storage
+        const STORE_NAME = 'notes';
+        const CONFIG_STORE_NAME = 'config';
+
+        // Initialize IndexedDB
+        function initDB() {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+                request.onerror = () => reject(request.error);
+                request.onsuccess = () => {
+                    db = request.result;
+                    resolve(db);
+                };
+
+                request.onupgradeneeded = (event) => {
+                    db = event.target.result;
+
+                    // Create notes store if it doesn't exist
+                    if (!db.objectStoreNames.contains(STORE_NAME)) {
+                        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+                    }
+
+                    // Create config store for non-sensitive settings
+                    // NOTE: GitHub tokens are now stored in the credentials store, not here
+                    if (!db.objectStoreNames.contains(CONFIG_STORE_NAME)) {
+                        db.createObjectStore(CONFIG_STORE_NAME, { keyPath: 'key' });
+                    }
+                };
+            });
+        }
+
+        // Secure logging utility to prevent sensitive data exposure
+        const secureLog = {
+            // Sensitive data patterns to redact
+            sensitivePatterns: [
+                /ghp_[a-zA-Z0-9]{36}/g, // GitHub Personal Access Tokens
+                /github_pat_[a-zA-Z0-9_]{82}/g, // GitHub fine-grained PATs
+                /passphrase/gi, // Passphrase references
+                /password/gi, // Password references
+                /token/gi, // Generic token references
+                /secret/gi, // Secret references
+                /key/gi, // Key references
+            ],
+            
+            // Redact sensitive information from objects and strings
+            redactSensitiveData: function(data) {
+                if (typeof data === 'string') {
+                    let redacted = data;
+                    this.sensitivePatterns.forEach(pattern => {
+                        redacted = redacted.replace(pattern, '[REDACTED]');
+                    });
+                    return redacted;
+                } else if (typeof data === 'object' && data !== null) {
+                    const redacted = {};
+                    for (const [key, value] of Object.entries(data)) {
+                        // Redact sensitive keys
+                        if (key.toLowerCase().includes('passphrase') || 
+                            key.toLowerCase().includes('token') || 
+                            key.toLowerCase().includes('password') || 
+                            key.toLowerCase().includes('secret') ||
+                            key.toLowerCase().includes('key')) {
+                            
+                            if (typeof value === 'string') {
+                                redacted[key] = value.length > 0 ? '[REDACTED]' : value;
+                            } else if (typeof value === 'number') {
+                                redacted[key] = value; // Keep lengths for debugging
+                            } else {
+                                redacted[key] = '[REDACTED]';
+                            }
+                        } else {
+                            redacted[key] = typeof value === 'object' ? this.redactSensitiveData(value) : value;
+                        }
+                    }
+                    return redacted;
+                }
+                return data;
+            },
+            
+            // Secure console.log replacement
+            log: function(message, ...args) {
+                const redactedMessage = this.redactSensitiveData(message);
+                const redactedArgs = args.map(arg => this.redactSensitiveData(arg));
+                console.log(redactedMessage, ...redactedArgs);
+            },
+            
+            // Secure console.error replacement
+            error: function(message, ...args) {
+                const redactedMessage = this.redactSensitiveData(message);
+                const redactedArgs = args.map(arg => this.redactSensitiveData(arg));
+                console.error(redactedMessage, ...redactedArgs);
+            },
+            
+            // Secure console.warn replacement
+            warn: function(message, ...args) {
+                const redactedMessage = this.redactSensitiveData(message);
+                const redactedArgs = args.map(arg => this.redactSensitiveData(arg));
+                console.warn(redactedMessage, ...redactedArgs);
+            }
+        };
+
+        // Simple encryption/decryption utilities using Web Crypto API
+        async function deriveKey(passphrase, salt) {
+            const enc = new TextEncoder();
+            const keyMaterial = await crypto.subtle.importKey(
+                'raw',
+                enc.encode(passphrase),
+                { name: 'PBKDF2' },
+                false,
+                ['deriveBits', 'deriveKey']
+            );
+
+            return crypto.subtle.deriveKey(
+                {
+                    name: 'PBKDF2',
+                    salt: salt,
+                    iterations: 600000, // Increased from 100,000 to 600,000+ per OWASP 2023 recommendation
+                    hash: 'SHA-256'
+                },
+                keyMaterial,
+                { name: 'AES-GCM', length: 256 },
+                true,
+                ['encrypt', 'decrypt']
+            );
+        }
+
+        // Secure random number generation with fallback
+        function secureRandomBytes(length) {
+            if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+                return crypto.getRandomValues(new Uint8Array(length));
+            } else if (typeof msCrypto !== 'undefined' && msCrypto.getRandomValues) {
+                // Fallback for older Internet Explorer
+                return msCrypto.getRandomValues(new Uint8Array(length));
+            } else {
+                // Fallback for environments without crypto API (should not happen in modern browsers)
+                console.warn('⚠️  No cryptographically secure random number generator available. Using Math.random() fallback.');
+                const bytes = new Uint8Array(length);
+                for (let i = 0; i < length; i++) {
+                    bytes[i] = Math.floor(Math.random() * 256);
+                }
+                return bytes;
+            }
+        }
+
+        async function encryptText(text, passphrase) {
+            const enc = new TextEncoder();
+            const salt = secureRandomBytes(16);
+            const iv = secureRandomBytes(12);
+
+            const key = await deriveKey(passphrase, salt);
+            const encrypted = await crypto.subtle.encrypt(
+                { name: 'AES-GCM', iv: iv },
+                key,
+                enc.encode(text)
+            );
+
+            // Combine salt, iv, and encrypted data
+            const combined = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
+            combined.set(salt, 0);
+            combined.set(iv, salt.length);
+            combined.set(new Uint8Array(encrypted), salt.length + iv.length);
+
+            // Convert to base64 for storage
+            return btoa(String.fromCharCode.apply(null, combined));
+        }
+
+        async function decryptText(encryptedData, passphrase) {
+            try {
+                secureLog.log('decryptText called with:', {
+                    encryptedDataType: typeof encryptedData,
+                    encryptedDataLength: encryptedData ? encryptedData.length : 'undefined',
+                    passphraseType: typeof passphrase,
+                    passphraseLength: passphrase ? passphrase.length : 'undefined'
+                });
+
+                if (!encryptedData || typeof encryptedData !== 'string') {
+                    throw new Error('Invalid encrypted data: must be a non-empty string. Received: ' + (typeof encryptedData) + ' with value: ' + encryptedData);
+                }
+
+                if (!passphrase || typeof passphrase !== 'string') {
+                    throw new Error('Invalid passphrase: must be a non-empty string. Received: ' + (typeof passphrase));
+                }
+
+                // Convert from base64
+                secureLog.log('Converting from base64...');
+                const combined = new Uint8Array(atob(encryptedData).split('').map(char => char.charCodeAt(0)));
+                secureLog.log('Combined data length:', combined.length);
+
+                // Extract salt, iv, and encrypted data
+                const salt = combined.slice(0, 16);
+                const iv = combined.slice(16, 28);
+                const encrypted = combined.slice(28);
+
+                secureLog.log('Extracted components:', {
+                    saltLength: salt.length,
+                    ivLength: iv.length,
+                    encryptedLength: encrypted.length
+                });
+
+                if (salt.length !== 16) {
+                    throw new Error('Invalid salt length: expected 16, got ' + salt.length);
+                }
+
+                if (iv.length !== 12) {
+                    throw new Error('Invalid IV length: expected 12, got ' + iv.length);
+                }
+
+                if (encrypted.length === 0) {
+                    throw new Error('No encrypted data found');
+                }
+
+                secureLog.log('Deriving key...');
+                const key = await deriveKey(passphrase, salt);
+                secureLog.log('Key derived successfully');
+
+                secureLog.log('Decrypting...');
+                const decrypted = await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv: iv },
+                    key,
+                    encrypted
+                );
+                secureLog.log('Decryption successful, decrypted length:', decrypted.byteLength);
+
+                const dec = new TextDecoder();
+                const result = dec.decode(decrypted);
+                secureLog.log('Text decoded successfully, result length:', result.length);
+                return result;
+            } catch (error) {
+                secureLog.error('decryptText error:', error);
+
+                // Provide more specific error messages based on the error type
+                if (error.message.includes('Invalid encrypted data')) {
+                    throw new Error('No valid encrypted token found. The GitHub token may not be properly stored.');
+                } else if (error.message.includes('Invalid passphrase')) {
+                    throw new Error('Passphrase is required but was not provided.');
+                } else if (error.message.includes('Invalid salt length') || error.message.includes('Invalid IV length')) {
+                    throw new Error('Corrupted encrypted data. The stored token appears to be damaged.');
+                } else if (error.name === 'OperationError' || error.message.includes('decrypt')) {
+                    throw new Error('Incorrect passphrase or corrupted data.');
+                } else {
+                    throw new Error('Decryption failed: ' + error.message);
+                }
+            }
+        }
+
+        // Transaction queue to prevent overlapping database operations
+        let transactionQueue = Promise.resolve();
+        
+        // Enhanced transaction queue for sync operations
+        // Sync operations have priority over regular operations
+        let syncTransactionQueue = Promise.resolve();
+        
+        // Queue sync-specific database operations with higher priority
+        function queueSyncOperation(operation) {
+            return syncTransactionQueue = syncTransactionQueue.then(operation);
+        }
+        
+        // Queue regular database operations
+        function queueRegularOperation(operation) {
+            return transactionQueue = transactionQueue.then(operation);
+        }
+
+        // Save notes to IndexedDB with encryption
+        async function saveNotesToDB(notes, isSyncOperation = false) {
+            // Queue this transaction to prevent overlapping operations
+            // Use sync queue for sync operations, regular queue for normal operations
+            const queueFunction = isSyncOperation ? queueSyncOperation : queueRegularOperation;
+            return queueFunction(async () => {
+                return new Promise(async (resolve, reject) => {
+                    try {
+                        console.log(`Starting database transaction for ${notes.length} notes`);
+
+                        // Pre-encrypt all notes before starting the transaction
+                        // This prevents async operations inside the transaction that could cause it to close
+                        const encryptedNotes = [];
+                        for (const note of notes) {
+                            try {
+                                const encryptedNote = await encryptNoteData(note);
+                                encryptedNotes.push(encryptedNote);
+                            } catch (error) {
+                                console.error('Failed to encrypt note:', note.id, error);
+                                // Fallback to unencrypted storage for this note
+                                encryptedNotes.push({ ...note, isEncrypted: false });
+                            }
+                        }
+
+                        console.log(`Encrypted ${encryptedNotes.length} notes, starting database transaction`);
+
+                        // Now perform the synchronous database operations
+                        const transaction = db.transaction([STORE_NAME], 'readwrite');
+                        const store = transaction.objectStore(STORE_NAME);
+
+                        // Clear existing notes
+                        const clearRequest = store.clear();
+                        clearRequest.onsuccess = () => {
+                            console.log('Cleared existing notes, adding new notes');
+                            // Add all pre-encrypted notes synchronously
+                            for (const encryptedNote of encryptedNotes) {
+                                store.add(encryptedNote);
+                            }
+                        };
+
+                        clearRequest.onerror = () => {
+                            console.error('Failed to clear existing notes:', clearRequest.error);
+                            reject(createSecureError('Failed to clear existing notes', clearRequest.error));
+                        };
+
+                        transaction.oncomplete = () => {
+                            console.log('Database transaction completed successfully');
+                            resolve();
+                        };
+
+                        transaction.onerror = () => {
+                            console.error('Database transaction failed:', transaction.error);
+                            reject(createSecureError('Database transaction failed', transaction.error));
+                        };
+                    } catch (error) {
+                        console.error('Failed to save notes:', error);
+                        reject(createSecureError('Failed to save notes', error));
+                    }
+                });
+            }).catch(error => {
+                console.error('Transaction queue error:', error);
+                throw error;
+            });
+        }
+
+        // Load notes from IndexedDB with decryption
+        async function loadNotesFromDB(isSyncOperation = false) {
+            // Queue this transaction to prevent overlapping operations
+            // Use sync queue for sync operations, regular queue for normal operations
+            const queueFunction = isSyncOperation ? queueSyncOperation : queueRegularOperation;
+            return queueFunction(async () => {
+                return new Promise(async (resolve, reject) => {
+                    try {
+                        console.log('Starting database read transaction');
+                        const transaction = db.transaction([STORE_NAME], 'readonly');
+                        const store = transaction.objectStore(STORE_NAME);
+                        const request = store.getAll();
+
+                        request.onsuccess = async () => {
+                            try {
+                                const encryptedNotes = request.result || [];
+                                console.log(`Loaded ${encryptedNotes.length} encrypted notes from database`);
+                                const decryptedNotes = [];
+
+                                for (const encryptedNote of encryptedNotes) {
+                                    const decryptedNote = await decryptNoteData(encryptedNote);
+                                    decryptedNotes.push(decryptedNote);
+                                }
+
+                                console.log(`Successfully decrypted ${decryptedNotes.length} notes`);
+                                resolve(decryptedNotes);
+                            } catch (error) {
+                                // If decryption fails, return empty array (data may be corrupted)
+                                console.warn('Failed to decrypt some notes, returning empty array');
+                                resolve([]);
+                            }
+                        };
+                        request.onerror = () => {
+                            console.error('Database read operation failed:', request.error);
+                            reject(createSecureError('Database operation failed', request.error));
+                        };
+                    } catch (error) {
+                        console.error('Failed to load notes:', error);
+                        reject(createSecureError('Failed to load notes', error));
+                    }
+                });
+            }).catch(error => {
+                console.error('Transaction queue error during load:', error);
+                throw error;
+            });
+        }
+
+        // Encrypt note data for storage
+        async function encryptNoteData(note) {
+            try {
+                // Generate a key for note encryption based on a static salt
+                // In a real application, this should be user-specific
+                const noteKey = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('notez-note-encryption-key'));
+                const keyArray = new Uint8Array(noteKey);
+
+                // Only encrypt the content field (title and metadata can remain unencrypted for search)
+                const encryptedContent = await encryptText(note.content, btoa(String.fromCharCode(...keyArray)).slice(0, 32));
+
+                return {
+                    ...note,
+                    content: encryptedContent,
+                    isEncrypted: true
+                };
+            } catch (error) {
+                console.error('Failed to encrypt note data:', error);
+                // Fallback to unencrypted storage
+                return { ...note, isEncrypted: false };
+            }
+        }
+
+        // Decrypt note data from storage
+        async function decryptNoteData(encryptedNote) {
+            try {
+                if (!encryptedNote.isEncrypted) {
+                    // Note is not encrypted, return as-is
+                    return encryptedNote;
+                }
+
+                // Generate the same key used for encryption
+                const noteKey = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('notez-note-encryption-key'));
+                const keyArray = new Uint8Array(noteKey);
+
+                const decryptedContent = await decryptText(encryptedNote.content, btoa(String.fromCharCode(...keyArray)).slice(0, 32));
+
+                return {
+                    ...encryptedNote,
+                    content: decryptedContent,
+                    isEncrypted: false
+                };
+            } catch (error) {
+                console.error('Failed to decrypt note data:', error);
+                // Return note with placeholder content if decryption fails
+                return {
+                    ...encryptedNote,
+                    content: '[ERROR: Unable to decrypt note content]',
+                    isEncrypted: false
+                };
+            }
+        }
+
+        // Helper function to detect if a token is encrypted
+        function isTokenEncrypted(token) {
+            if (!token) return false;
+            // Plain GitHub tokens start with these prefixes
+            return !token.startsWith('ghp_') && !token.startsWith('github_pat_');
+        }
+
+        // Security functions for input validation and sanitization
+        function sanitizeHtml(input) {
+            if (!input || typeof input !== 'string') return '';
+
+            // Create a temporary div to leverage browser's HTML parsing
+            const tempDiv = document.createElement('div');
+            tempDiv.textContent = input;
+            return tempDiv.innerHTML;
+        }
+
+        function sanitizeForMarkdown(input) {
+            if (!input || typeof input !== 'string') return '';
+
+            // Remove potential XSS vectors while preserving markdown functionality
+            return input
+                .replace(/<script[^>]*>.*?<\/script>/gi, '') // Remove script tags
+                .replace(/<iframe[^>]*>.*?<\/iframe>/gi, '') // Remove iframe tags
+                .replace(/<object[^>]*>.*?<\/object>/gi, '') // Remove object tags
+                .replace(/<embed[^>]*>/gi, '') // Remove embed tags
+                .replace(/javascript:/gi, '') // Remove javascript: protocol
+                .replace(/vbscript:/gi, '') // Remove vbscript: protocol
+                .replace(/data:(?!image\/(?:png|jpe?g|gif|svg|webp);base64,)/gi, '') // Remove data: protocol except for images
+                .replace(/on\w+\s*=/gi, ''); // Remove event handlers
+        }
+
+        function normalizeGitHubRepositoryUrl(url) {
+            if (!url || typeof url !== 'string') return '';
+
+            let normalized = url.trim();
+
+            // Convert http to https for security
+            if (normalized.startsWith('http://github.com/')) {
+                normalized = normalized.replace('http://github.com/', 'https://github.com/');
+            }
+
+            // Remove trailing slash for consistency
+            if (normalized.endsWith('/')) {
+                normalized = normalized.slice(0, -1);
+            }
+
+            return normalized;
+        }
+
+        function validateGitHubRepositoryUrl(url) {
+            if (!url || typeof url !== 'string') return false;
+
+            // First normalize the URL
+            const normalizedUrl = normalizeGitHubRepositoryUrl(url);
+
+            // Strict validation for GitHub repository URLs
+            const githubRepoRegex = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/?$/;
+            return githubRepoRegex.test(normalizedUrl);
+        }
+
+        function validateGitHubToken(token) {
+            if (!token || typeof token !== 'string') return false;
+
+            // Validate GitHub token format (either encrypted or valid GitHub token format)
+            if (isTokenEncrypted(token)) {
+                // For encrypted tokens, check if it looks like encrypted data (base64-like)
+                const base64Regex = /^[A-Za-z0-9+/=]{40,}$/;
+                return base64Regex.test(token);
+            }
+
+            // Check for valid GitHub token patterns
+            const githubTokenRegex = /^(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{82})$/;
+            return githubTokenRegex.test(token);
+        }
+
+        // Rate limiting implementation
+        const rateLimiters = new Map();
+
+        function checkRateLimit(key, maxRequests = 5, windowMs = 60000) {
+            const now = Date.now();
+            const limiter = rateLimiters.get(key) || { count: 0, resetTime: now + windowMs };
+
+            // Reset if window has expired
+            if (now > limiter.resetTime) {
+                limiter.count = 0;
+                limiter.resetTime = now + windowMs;
+            }
+
+            if (limiter.count >= maxRequests) {
+                return false; // Rate limit exceeded
+            }
+
+            limiter.count++;
+            rateLimiters.set(key, limiter);
+            return true;
+        }
+
+        // Secure error handling without information disclosure
+        function createSecureError(message, details = null) {
+            const error = new Error(message);
+
+            // Log detailed error for debugging (only in development)
+            if (details && console && console.error) {
+                secureLog.error('Detailed error information:', details);
+            }
+
+            return error;
+        }
+
+        // Validate that no sensitive data is being stored in localStorage
+        function validateStorageData(key, data) {
+            // Only validate if it's a string that might contain sensitive data
+            if (typeof data === 'string') {
+                // Check for unencrypted GitHub tokens
+                if (data.includes('ghp_') || data.includes('github_pat_')) {
+                    throw createSecureError(`Attempted to store unencrypted GitHub token in localStorage key: ${key}`);
+                }
+                
+                // Check for other potentially sensitive patterns
+                const sensitivePatterns = [
+                    /password["\s]*[:=]["\s]*[^"]+/i,
+                    /passphrase["\s]*[:=]["\s]*[^"]+/i,
+                    /secret["\s]*[:=]["\s]*[^"]+/i,
+                ];
+                
+                for (const pattern of sensitivePatterns) {
+                    if (pattern.test(data)) {
+                        secureLog.warn(`Potentially sensitive data detected in localStorage key: ${key}`);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Secure wrapper for localStorage.setItem
+        function secureLocalStorageSetItem(key, value) {
+            try {
+                validateStorageData(key, value);
+                localStorage.setItem(key, value);
+            } catch (error) {
+                secureLog.error('Failed to validate storage data:', error);
+                throw error;
+            }
+        }
+
+        // Save GitHub configuration to credentials store
+        // Save GitHub configuration to localStorage (token is now encrypted)
+        async function saveGitHubConfigToCredentials(config) {
+            try {
+                // Input validation
+                if (!config || typeof config !== 'object') {
+                    throw createSecureError('Invalid configuration object', { configType: typeof config });
+                }
+
+                // Normalize repository URL if provided
+                if (config.repositoryUrl) {
+                    config.repositoryUrl = normalizeGitHubRepositoryUrl(config.repositoryUrl);
+                }
+
+                // Validate repository URL if provided
+                if (config.repositoryUrl && !validateGitHubRepositoryUrl(config.repositoryUrl)) {
+                    throw createSecureError('Invalid GitHub repository URL format');
+                }
+
+                // Validate token if provided
+                if (config.personalAccessToken && !validateGitHubToken(config.personalAccessToken)) {
+                    throw createSecureError('Invalid GitHub token format');
+                }
+
+                // Security check: ensure the token is encrypted (not a plain GitHub token)
+                if (config.personalAccessToken && !isTokenEncrypted(config.personalAccessToken)) {
+                    secureLog.error('⚠️ SECURITY WARNING: Attempting to save unencrypted GitHub token!');
+                    secureLog.error('Token starts with:', config.personalAccessToken.substring(0, 10) + '...');
+                    console.trace('Stack trace for unencrypted token save attempt:');
+                    throw createSecureError('Cannot save unencrypted GitHub token to storage');
+                }
+
+                // Store the entire config in localStorage since the token is now encrypted
+                secureLocalStorageSetItem('notez-github-config', JSON.stringify(config));
+                secureLog.log('✅ GitHub config saved to localStorage successfully (token encrypted)');
+
+                // Debug: Check what we actually saved
+                const savedConfig = JSON.parse(localStorage.getItem('notez-github-config'));
+                console.log('📝 Saved config verification:', {
+                    repositoryUrl: savedConfig.repositoryUrl || '[NOT SET]',
+                    hasToken: !!(savedConfig.personalAccessToken),
+                    tokenLength: savedConfig.personalAccessToken?.length || 0,
+                    tokenIsEncrypted: isTokenEncrypted(savedConfig.personalAccessToken),
+                    enabled: savedConfig.enabled,
+                    lastSyncTime: savedConfig.lastSyncTime,
+                    lastSyncRef: savedConfig.lastSyncRef || '[NOT SET]'
+                });
+            } catch (error) {
+                console.error('Failed to save GitHub config to localStorage:', error);
+                throw error;
+            }
+        }
+
+        // Load GitHub configuration from localStorage (token is now encrypted)  
+        async function loadGitHubConfigFromCredentials() {
+            try {
+                const configJson = localStorage.getItem('notez-github-config');
+                if (configJson) {
+                    const config = JSON.parse(configJson);
+                    console.log('✅ GitHub config loaded from localStorage successfully');
+                    console.log('📝 Loaded config verification:', {
+                        repositoryUrl: config.repositoryUrl || '[NOT SET]',
+                        hasToken: !!(config.personalAccessToken),
+                        tokenLength: config.personalAccessToken?.length || 0,
+                        tokenIsEncrypted: isTokenEncrypted(config.personalAccessToken),
+                        enabled: config.enabled,
+                        lastSyncTime: config.lastSyncTime,
+                        lastSyncRef: config.lastSyncRef || '[NOT SET]'
+                    });
+                    return config;
+                } else {
+                    console.log('No GitHub config found in localStorage');
+                    return null;
+                }
+            } catch (error) {
+                console.error('Failed to load GitHub config from localStorage:', error);
+                return null;
+            }
+        }
+
+        // Fallback functions for localStorage (when Credentials API is not available)
+        function saveGitHubConfigToLocalStorage(config) {
+            try {
+                // Same security check as the main function
+                if (config.personalAccessToken && !isTokenEncrypted(config.personalAccessToken)) {
+                    secureLog.error('⚠️ SECURITY WARNING: Attempting to save unencrypted GitHub token to localStorage fallback!');
+                    secureLog.error('Token starts with:', config.personalAccessToken.substring(0, 10) + '...');
+                    console.trace('Stack trace for unencrypted token save attempt:');
+                    throw new Error('Cannot save unencrypted GitHub token to storage');
+                }
+
+                secureLocalStorageSetItem('notez-github-config-full', JSON.stringify(config));
+                secureLog.log('✅ GitHub configuration saved to localStorage (fallback) - token encrypted');
+            } catch (error) {
+                console.error('Error saving GitHub config to localStorage:', error);
+                throw error;
+            }
+        }
+
+        function loadGitHubConfigFromLocalStorage() {
+            try {
+                const configStr = localStorage.getItem('notez-github-config-full');
+                if (configStr) {
+                    const config = JSON.parse(configStr);
+                    console.log('✅ GitHub config loaded from localStorage fallback:', {
+                        repositoryUrl: config.repositoryUrl || '[NOT SET]',
+                        hasToken: !!(config.personalAccessToken),
+                        tokenLength: config.personalAccessToken?.length || 0,
+                        tokenIsEncrypted: isTokenEncrypted(config.personalAccessToken),
+                        enabled: config.enabled
+                    });
+                    return config;
+                }
+                console.log('No GitHub config found in localStorage fallback');
+                return null;
+            } catch (error) {
+                console.error('Error loading GitHub config from localStorage:', error);
+                return null;
+            }
+        }
+
+        // Commit SHA caching for performance optimization with integrity checks
+        const COMMIT_CACHE_KEY = 'notez-commit-cache';
+        const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+        // Generate integrity hash for cache entry
+        async function generateCacheHash(data) {
+            const encoder = new TextEncoder();
+            const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(JSON.stringify(data)));
+            return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+
+        // Verify cache entry integrity
+        async function verifyCacheIntegrity(entry) {
+            try {
+                const dataToHash = { sha: entry.sha, timestamp: entry.timestamp };
+                const expectedHash = await generateCacheHash(dataToHash);
+                return entry.integrity === expectedHash;
+            } catch (error) {
+                console.error('Error verifying cache integrity:', error);
+                return false;
+            }
+        }
+
+        async function getCachedCommitSha(repoUrl) {
+            try {
+                const cache = JSON.parse(localStorage.getItem(COMMIT_CACHE_KEY) || '{}');
+                const entry = cache[repoUrl];
+
+                if (entry && Date.now() - entry.timestamp < CACHE_DURATION) {
+                    // Verify cache integrity
+                    if (entry.integrity && await verifyCacheIntegrity(entry)) {
+                        return entry.sha;
+                    } else {
+                        console.warn('Cache integrity check failed, removing corrupted entry');
+                        delete cache[repoUrl];
+                        localStorage.setItem(COMMIT_CACHE_KEY, JSON.stringify(cache));
+                    }
+                }
+            } catch (error) {
+                console.error('Error reading commit cache:', error);
+            }
+            return null;
+        }
+
+        async function setCachedCommitSha(repoUrl, sha) {
+            try {
+                const cache = JSON.parse(localStorage.getItem(COMMIT_CACHE_KEY) || '{}');
+                const timestamp = Date.now();
+                const dataToHash = { sha, timestamp };
+                const integrity = await generateCacheHash(dataToHash);
+
+                cache[repoUrl] = { sha, timestamp, integrity };
+                localStorage.setItem(COMMIT_CACHE_KEY, JSON.stringify(cache));
+            } catch (error) {
+                console.error('Error writing commit cache:', error);
+            }
+        }
+
+        // Clear commit cache for a specific repository to force fresh API calls
+        async function clearCachedCommitSha(repoUrl) {
+            try {
+                const cache = JSON.parse(localStorage.getItem(COMMIT_CACHE_KEY) || '{}');
+                if (cache[repoUrl]) {
+                    delete cache[repoUrl];
+                    localStorage.setItem(COMMIT_CACHE_KEY, JSON.stringify(cache));
+                    console.log(`🗑️  Cleared commit cache for ${repoUrl}`);
+                }
+            } catch (error) {
+                console.error('Error clearing commit cache:', error);
+            }
+        }
+
+        // Diagnostic function to test Credentials API capabilities
+        async function testCredentialsAPI() {
+            console.log('=== Credentials API Diagnostic Test ===');
+
+            // Test 1: Check basic API availability
+            console.log('1. Checking API availability...');
+            console.log('navigator.credentials:', !!navigator.credentials);
+            console.log('navigator.credentials.store:', !!(navigator.credentials && navigator.credentials.store));
+            console.log('navigator.credentials.get:', !!(navigator.credentials && navigator.credentials.get));
+            console.log('window.PasswordCredential:', !!window.PasswordCredential);
+
+            if (!navigator.credentials || !navigator.credentials.store || !window.PasswordCredential) {
+                console.log('❌ Credentials API not fully supported');
+                return false;
+            }
+
+            // Test 2: Try storing and retrieving a test credential
+            console.log('2. Testing credential storage and retrieval...');
+            try {
+                const testCredential = new PasswordCredential({
+                    id: 'notez-test-credential',
+                    password: 'test-password-123',
+                    name: 'Test Credential'
+                });
+
+                await navigator.credentials.store(testCredential);
+                console.log('✓ Test credential stored successfully');
+
+                // Try to retrieve it
+                const retrieved = await navigator.credentials.get({
+                    password: true,
+                    mediation: 'silent'
+                });
+
+                if (retrieved && retrieved.id === 'notez-test-credential' && retrieved.password === 'test-password-123') {
+                    console.log('✓ Test credential retrieved successfully');
+                    return true;
+                } else {
+                    console.log('⚠ Test credential could not be retrieved properly');
+                    console.log('Retrieved:', retrieved ? { id: retrieved.id, hasPassword: !!retrieved.password } : 'null');
+                    return false;
+                }
+            } catch (error) {
+                console.log('❌ Test credential storage/retrieval failed:', error);
+                return false;
+            }
+        }
+
+        // Debug function for manual testing (can be called from browser console)
+        window.debugGitHubConfig = async function () {
+            console.log('=== GitHub Configuration Debug ===');
+
+            // Test Credentials API
+            console.log('\n1. Testing Credentials API...');
+            await testCredentialsAPI();
+
+            // Check localStorage fallback
+            console.log('\n2. Checking localStorage fallback...');
+            const fallbackConfig = loadGitHubConfigFromLocalStorage();
+            console.log('Fallback config:', fallbackConfig ? {
+                repositoryUrl: fallbackConfig.repositoryUrl || '[NOT SET]',
+                hasToken: !!(fallbackConfig.personalAccessToken),
+                tokenLength: fallbackConfig.personalAccessToken?.length || 0,
+                tokenIsEncrypted: isTokenEncrypted(fallbackConfig.personalAccessToken),
+                enabled: fallbackConfig.enabled
+            } : 'No fallback config found');
+
+            // Check public config in localStorage
+            console.log('\n3. Checking public config in localStorage...');
+            const publicConfigStr = localStorage.getItem('notez-github-config');
+            if (publicConfigStr) {
+                try {
+                    const publicConfig = JSON.parse(publicConfigStr);
+                    console.log('Public config:', {
+                        repositoryUrl: publicConfig.repositoryUrl || '[NOT SET]',
+                        hasToken: !!(publicConfig.personalAccessToken),
+                        tokenLength: publicConfig.personalAccessToken?.length || 0,
+                        tokenIsEncrypted: isTokenEncrypted(publicConfig.personalAccessToken),
+                        enabled: publicConfig.enabled,
+                        lastSyncTime: publicConfig.lastSyncTime,
+                        lastSyncRef: publicConfig.lastSyncRef || '[NOT SET]'
+                    });
+                } catch (error) {
+                    console.log('Error parsing public config:', error);
+                }
+            } else {
+                console.log('No public config found');
+            }
+
+            // Try to load the complete configuration
+            console.log('\n4. Loading complete configuration...');
+            const completeConfig = await loadGitHubConfigFromCredentials();
+            console.log('Complete config result:', completeConfig ? {
+                repositoryUrl: completeConfig.repositoryUrl || '[NOT SET]',
+                hasToken: !!(completeConfig.personalAccessToken),
+                tokenLength: completeConfig.personalAccessToken?.length || 0,
+                tokenIsEncrypted: isTokenEncrypted(completeConfig.personalAccessToken),
+                enabled: completeConfig.enabled,
+                lastSyncTime: completeConfig.lastSyncTime,
+                lastSyncRef: completeConfig.lastSyncRef || '[NOT SET]'
+            } : 'No configuration loaded');
+
+            secureLog.log('\n=== Security Check Results ===');
+            if (completeConfig && completeConfig.personalAccessToken) {
+                if (isTokenEncrypted(completeConfig.personalAccessToken)) {
+                    secureLog.log('✅ Token is properly encrypted in storage');
+                } else {
+                    secureLog.error('❌ SECURITY ISSUE: Token is stored in plain text!');
+                }
+            } else {
+                secureLog.log('ℹ️ No token found in storage');
+            }
+
+            console.log('\n=== Debug Complete ===');
+            return completeConfig;
+        };
+
+        // Test encryption/decryption functionality
+        window.testEncryptionDecryption = async function (testText = "test-token-12345", testPassphrase = "test-passphrase") {
+            secureLog.log('=== Testing Encryption/Decryption ===');
+            secureLog.log('Test text:', testText);
+            secureLog.log('Test passphrase:', testPassphrase);
+
+            try {
+                // Test encryption
+                secureLog.log('\n1. Testing encryption...');
+                const encrypted = await encryptText(testText, testPassphrase);
+                secureLog.log('Encryption successful, encrypted length:', encrypted.length);
+                secureLog.log('Encrypted data (first 50 chars):', encrypted.substring(0, 50) + '...');
+
+                // Test decryption
+                secureLog.log('\n2. Testing decryption...');
+                const decrypted = await decryptText(encrypted, testPassphrase);
+                console.log('Decryption successful, decrypted text:', decrypted);
+
+                // Verify they match
+                if (decrypted === testText) {
+                    console.log('✓ Encryption/Decryption test PASSED');
+                    return { success: true, encrypted, decrypted };
+                } else {
+                    console.log('✗ Encryption/Decryption test FAILED - texts do not match');
+                    return { success: false, error: 'Decrypted text does not match original' };
+                }
+            } catch (error) {
+                console.error('✗ Encryption/Decryption test FAILED with error:', error);
+                return { success: false, error: error.message };
+            }
+        };
+
+        // Migration function to move existing GitHub config from IndexedDB to credentials store
+        async function migrateGitHubConfigToCredentials() {
+            try {
+                // Check if we already have credentials stored
+                const existingConfig = await loadGitHubConfigFromCredentials();
+                if (existingConfig && existingConfig.personalAccessToken) {
+                    console.log('GitHub credentials already exist in credentials store, skipping migration');
+                    return;
+                }
+
+                // Try to load from IndexedDB
+                const oldConfig = await new Promise((resolve) => {
+                    try {
+                        if (!db) {
+                            resolve(null);
+                            return;
+                        }
+
+                        const transaction = db.transaction([CONFIG_STORE_NAME], 'readonly');
+                        const store = transaction.objectStore(CONFIG_STORE_NAME);
+                        const request = store.get('github');
+
+                        request.onsuccess = () => {
+                            const result = request.result;
+                            resolve(result && result.value ? result.value : null);
+                        };
+                        request.onerror = () => resolve(null);
+                    } catch (error) {
+                        console.warn('Error accessing IndexedDB during migration:', error);
+                        resolve(null);
+                    }
+                });
+
+                if (oldConfig && oldConfig.personalAccessToken) {
+                    console.log('Migrating GitHub configuration from IndexedDB to credentials store');
+                    await saveGitHubConfigToCredentials(oldConfig);
+
+                    // Remove from IndexedDB after successful migration
+                    try {
+                        const transaction = db.transaction([CONFIG_STORE_NAME], 'readwrite');
+                        const store = transaction.objectStore(CONFIG_STORE_NAME);
+                        store.delete('github');
+                        console.log('Removed GitHub config from IndexedDB after migration');
+                    } catch (error) {
+                        console.warn('Failed to remove GitHub config from IndexedDB after migration:', error);
+                    }
+                }
+            } catch (error) {
+                console.warn('Migration from IndexedDB to credentials store failed:', error);
+            }
+        }
+
+        // Helper function to sanitize filenames
+        function sanitizeFilename(title) {
+            return title
+                .toLowerCase()
+                .replace(/ /g, '_')
+                .replace(/\//g, '_')
+                .replace(/\\/g, '_')
+                .replace(/:/g, '_')
+                .replace(/\*/g, '_')
+                .replace(/\?/g, '_')
+                .replace(/"/g, '_')
+                .replace(/</g, '_')
+                .replace(/>/g, '_')
+                .replace(/\|/g, '_')
+                .replace(/\./g, '_')
+                .replace(/\n/g, '_')
+                .replace(/\r/g, '_')
+                .replace(/\t/g, '_')
+                .trim()
+                .substring(0, 50) || 'untitled';
+        }
+
+        // Helper function to determine the correct authorization header format
+        function getAuthorizationHeader(token) {
+            // Fine-grained tokens start with 'github_pat_'
+            // Classic tokens start with 'ghp_'
+            if (token.startsWith('github_pat_')) {
+                return `Bearer ${token}`;
+            } else {
+                return `token ${token}`;
+            }
+        }
+
+        // Function to get the latest commit SHA from a repository branch
+        async function getLatestCommitSha(repositoryUrl, token, branch = 'main', forceRefresh = false) {
+            try {
+                // Apply rate limiting
+                const rateLimitKey = `github-api-${repositoryUrl}`;
+                if (!checkRateLimit(rateLimitKey, 30, 60000)) { // 30 requests per minute per repository
+                    throw createSecureError('Rate limit exceeded. Please wait before making more requests.');
+                }
+
+                // Only use cache if not forcing refresh and for non-critical operations
+                if (!forceRefresh) {
+                    const cachedSha = await getCachedCommitSha(repositoryUrl);
+                    if (cachedSha) {
+                        console.log(`Using cached commit SHA for ${repositoryUrl}: ${cachedSha}`);
+                        return cachedSha;
+                    }
+                }
+
+                console.log(`Fetching latest commit SHA from GitHub API for ${repositoryUrl}`);
+                const url = new URL(repositoryUrl);
+                const pathParts = url.pathname.split('/').filter(part => part.length > 0);
+
+                if (pathParts.length < 2) {
+                    throw createSecureError('Invalid repository URL format');
+                }
+
+                const owner = pathParts[0];
+                const repo = pathParts[1];
+                const apiUrl = `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch}`;
+
+                const headers = {
+                    'Authorization': getAuthorizationHeader(token),
+                    'Accept': 'application/vnd.github+json',
+                    'X-GitHub-Api-Version': '2022-11-28'
+                };
+
+                const response = await fetch(apiUrl, {
+                    method: 'GET',
+                    headers: headers
+                });
+
+                if (!response.ok) {
+                    throw createSecureError(`Failed to get repository information: ${response.status}`, {
+                        status: response.status,
+                        statusText: response.statusText,
+                        url: apiUrl
+                    });
+                }
+
+                const refData = await response.json();
+                const sha = refData.object.sha;
+
+                // Always cache the fresh result
+                await setCachedCommitSha(repositoryUrl, sha);
+                console.log(`✓ Latest commit SHA: ${sha}`);
+
+                return sha;
+
+            } catch (error) {
+                console.error('Error getting latest commit SHA:', error);
+                throw error;
+            }
+        }
+
+        // Function to compare two commits and get changed files
+        async function compareCommits(repositoryUrl, token, baseCommit, headCommit) {
+            try {
+                const url = new URL(repositoryUrl);
+                const pathParts = url.pathname.split('/').filter(part => part.length > 0);
+                const owner = pathParts[0];
+                const repo = pathParts[1];
+                const apiUrl = `https://api.github.com/repos/${owner}/${repo}/compare/${baseCommit}...${headCommit}`;
+
+                const headers = {
+                    'Authorization': getAuthorizationHeader(token),
+                    'Accept': 'application/vnd.github+json',
+                    'X-GitHub-Api-Version': '2022-11-28'
+                };
+
+                const response = await fetch(apiUrl, { method: 'GET', headers: headers });
+                if (!response.ok) {
+                    throw new Error(`Failed to compare commits: ${response.status} ${response.statusText}`);
+                }
+
+                return await response.json();
+            } catch (error) {
+                console.error('Error comparing commits:', error);
+                throw error;
+            }
+        }
+
+        // Function to fetch only changed markdown files since last sync
+        async function fetchChangedNotesSinceLastSync(config) {
+            try {
+                if (!config.lastSyncRef) {
+                    console.log('❌ No last sync reference found, performing full sync');
+                    const fullNotes = await pullNotesFromGitHub(config);
+                    return { changedNotes: fullNotes, deletedFiles: [], hasChanges: fullNotes.length > 0 };
+                }
+
+                console.log(`🔍 Checking for upstream changes since last sync: ${config.lastSyncRef}`);
+
+                // Step 1: Get current HEAD ref to check if there are ANY upstream changes
+                // Force refresh to ensure we get the latest commit SHA, not cached
+                const currentRef = await getLatestCommitSha(config.repositoryUrl, config.personalAccessToken, 'main', true);
+                console.log(`📍 Current remote HEAD: ${currentRef}`);
+
+                if (config.lastSyncRef === currentRef) {
+                    console.log('✅ Repository unchanged since last sync - no upstream changes detected');
+                    console.log('📝 This is the correct behavior - incremental sync working as intended');
+                    return { changedNotes: [], deletedFiles: [], hasChanges: false };
+                }
+
+                console.log(`🚀 Upstream changes detected! Performing INCREMENTAL sync from ${config.lastSyncRef} to ${currentRef}`);
+                console.log(`📊 This will fetch ONLY the files that changed, not the entire repository`);
+
+                // CRITICAL: We have lastSyncRef and changes detected - this MUST be incremental, never full sync!
+
+                console.log(`✓ Upstream changes detected! Fetching incremental changes from ${config.lastSyncRef} to ${currentRef}`)
+
+                // Step 2: Compare commits to get ONLY the files that changed between lastSyncRef and currentRef
+                console.log('Comparing commits to identify changed files...');
+                const comparison = await compareCommits(config.repositoryUrl, config.personalAccessToken, config.lastSyncRef, currentRef);
+
+                console.log('📋 Commit comparison result:', {
+                    totalFiles: comparison.files ? comparison.files.length : 0,
+                    commits: comparison.commits ? comparison.commits.length : 0,
+                    files: comparison.files ? comparison.files.map(f => ({ name: f.filename, status: f.status })) : []
+                });
+
+                // Step 3: Filter for markdown files only
+                const changedMarkdownFiles = comparison.files.filter(file =>
+                    file.filename.endsWith('.md') &&
+                    (file.status === 'added' || file.status === 'modified')
+                );
+
+                const deletedMarkdownFiles = comparison.files.filter(file =>
+                    file.filename.endsWith('.md') && file.status === 'removed'
+                );
+
+                console.log(`📄 Filtered results: ${changedMarkdownFiles.length} changed and ${deletedMarkdownFiles.length} deleted markdown files since last sync`);
+                console.log('Changed markdown files:', changedMarkdownFiles.map(f => ({ name: f.filename, status: f.status })));
+                console.log('Deleted markdown files:', deletedMarkdownFiles.map(f => ({ name: f.filename, status: f.status })));
+
+                // Step 4: Fetch content for each changed markdown file (only the ones that changed!)
+                const changedNotes = [];
+                const url = new URL(config.repositoryUrl);
+                const pathParts = url.pathname.split('/').filter(part => part.length > 0);
+                const owner = pathParts[0];
+                const repo = pathParts[1];
+                const apiBase = `https://api.github.com/repos/${owner}/${repo}`;
+
+                const headers = {
+                    'Authorization': getAuthorizationHeader(config.personalAccessToken),
+                    'Accept': 'application/vnd.github+json',
+                    'X-GitHub-Api-Version': '2022-11-28'
+                };
+
+                console.log('Fetching content for changed files...');
+                for (const file of changedMarkdownFiles) {
+                    try {
+                        console.log(`Fetching content for changed file: ${file.filename}`);
+                        const encodedFilePath = encodeURIComponent(file.filename);
+                        const fileContentResponse = await fetch(`${apiBase}/contents/${encodedFilePath}`, {
+                            method: 'GET',
+                            headers: headers
+                        });
+
+                        if (fileContentResponse.ok) {
+                            const fileData = await fileContentResponse.json();
+                            const content = atob(fileData.content.replace(/\s/g, ''));
+                            console.log(`📄 Fetched content for ${file.filename}, length: ${content.length}`);
+                            const note = parseMarkdownNote(content, file.filename);
+                            if (note) {
+                                changedNotes.push(note);
+                                console.log(`✅ Successfully parsed and added changed note: ${note.title} (ID: ${note.id})`);
+                            } else {
+                                console.warn(`⚠️  Failed to parse note from ${file.filename}`);
+                            }
+                        } else {
+                            console.error(`Failed to fetch content for ${file.filename}: ${fileContentResponse.status}`);
+                        }
+                    } catch (error) {
+                        console.error(`Error fetching file ${file.filename}:`, error);
+                    }
+                }
+
+                console.log(`✅ Successfully fetched and parsed ${changedNotes.length} changed notes from upstream`);
+                console.log('Changed notes:', changedNotes.map(note => ({ id: note.id, title: note.title })));
+
+                return {
+                    changedNotes,
+                    deletedFiles: deletedMarkdownFiles.map(f => f.filename),
+                    hasChanges: changedNotes.length > 0 || deletedMarkdownFiles.length > 0
+                };
+
+            } catch (error) {
+                console.error('❌ Error during incremental sync:', error);
+
+                // Provide specific error handling for common issues
+                if (error.message.includes('404')) {
+                    console.warn('⚠️  Repository or branch not found - this may be a new repository');
+                } else if (error.message.includes('403')) {
+                    console.warn('⚠️  API rate limit or authorization issue detected');
+                } else if (error.message.includes('Invalid last sync reference')) {
+                    console.warn('⚠️  Last sync reference is invalid - repository history may have been rewritten');
+                }
+
+                // Only fall back to full sync in extreme cases
+                console.error(`💥 INCREMENTAL SYNC FAILED - this should be rare!`);
+                console.log('🔄 Falling back to full sync as last resort (this defeats the purpose of incremental sync)');
+                try {
+                    const fullNotes = await pullNotesFromGitHub(config);
+                    console.log(`⚠️  Fallback complete: fetched ${fullNotes.length} notes via FULL sync (this is slow!)`);
+                    return { changedNotes: fullNotes, deletedFiles: [], hasChanges: fullNotes.length > 0 };
+                } catch (fullSyncError) {
+                    console.error('❌ Full sync fallback also failed:', fullSyncError);
+                    // Return empty result if both incremental and full sync fail
+                    return { changedNotes: [], deletedFiles: [], hasChanges: false };
+                }
+            }
+        }
+
+        // Simple GitHub API client (basic implementation)
+        async function performGitHubSync(config) {
+            try {
+                console.log('Starting GitHub sync with repository:', config.repositoryUrl);
+
+                // Security check: Verify we're working with a decrypted token for sync
+                if (config.personalAccessToken && isTokenEncrypted(config.personalAccessToken)) {
+                    throw new Error('Cannot sync with encrypted token - token must be decrypted for API calls');
+                }
+
+                // Reminder: This token is temporarily decrypted ONLY for this sync operation
+                console.log('🔒 Using temporarily decrypted token for sync (will not be saved)');
+
+                // Extract owner and repo from URL
+                const url = new URL(config.repositoryUrl);
+                const pathParts = url.pathname.split('/').filter(part => part.length > 0);
+
+                if (pathParts.length < 2) {
+                    throw new Error('Invalid repository URL format');
+                }
+
+                const owner = pathParts[0];
+                const repo = pathParts[1];
+                const apiBase = `https://api.github.com/repos/${owner}/${repo}`;
+
+                // Headers for GitHub API with support for fine-grained tokens
+                const headers = {
+                    'Authorization': getAuthorizationHeader(config.personalAccessToken),
+                    'Accept': 'application/vnd.github+json',
+                    'X-GitHub-Api-Version': '2022-11-28',
+                    'Content-Type': 'application/json'
+                };
+
+                // Tracking variables for sync results
+                let addedFromRemote = 0;
+                let updatedFromRemote = 0;
+
+                // Step 1: Check for upstream changes and fetch only incremental changes
+                console.log('🔍 Checking for upstream changes...');
+                const incrementalChanges = await fetchChangedNotesSinceLastSync(config);
+
+                console.log('📊 Incremental changes result:', {
+                    hasChanges: incrementalChanges.hasChanges,
+                    changedNotesCount: incrementalChanges.changedNotes.length,
+                    deletedFilesCount: incrementalChanges.deletedFiles.length,
+                    changedNoteIds: incrementalChanges.changedNotes.map(n => n.id),
+                    deletedFiles: incrementalChanges.deletedFiles
+                });
+
+                if (!incrementalChanges.hasChanges) {
+                    console.log('✓ No upstream changes detected - repository is up to date');
+                } else {
+                    console.log(`✓ Found upstream changes: ${incrementalChanges.changedNotes.length} changed notes and ${incrementalChanges.deletedFiles.length} deleted files`);
+                }
+
+                // Step 2: Load current local notes
+                const localNotes = await loadNotesFromDB();
+                console.log(`Found ${localNotes.length} local notes`);
+
+                // Step 3: Apply incremental upstream changes to local notes (if any)
+                const mergedNotes = [...localNotes];
+
+                if (incrementalChanges.hasChanges) {
+                    console.log('📥 Applying upstream changes to local notes...');
+
+                    // Process changed/added notes from upstream
+                    for (const remoteNote of incrementalChanges.changedNotes) {
+                        const localNoteIndex = mergedNotes.findIndex(local => local.id === remoteNote.id);
+
+                        if (localNoteIndex === -1) {
+                            // Note doesn't exist locally, add it
+                            mergedNotes.push({ ...remoteNote });
+                            addedFromRemote++;
+                            console.log(`➕ Added new note from upstream: ${remoteNote.title}`);
+                        } else {
+                            // Note exists locally, check if remote version is newer
+                            const localNote = mergedNotes[localNoteIndex];
+                            
+                            // Ensure proper timestamp comparison by converting to numbers
+                            const remoteTimestamp = Number(remoteNote.editedAt);
+                            const localTimestamp = Number(localNote.editedAt);
+                            
+                            if (remoteTimestamp > localTimestamp) {
+                                mergedNotes[localNoteIndex] = { ...remoteNote };
+                                updatedFromRemote++;
+                                console.log(`🔄 Updated note from upstream: ${remoteNote.title} (remote: ${remoteTimestamp} > local: ${localTimestamp})`);
+                            } else {
+                                console.log(`⏭️  Skipped older remote version: ${remoteNote.title} (remote: ${remoteTimestamp} <= local: ${localTimestamp})`);
+                            }
+                        }
+                    }
+
+                    // Process deleted files from upstream
+                    let deletedCount = 0;
+                    for (const deletedFile of incrementalChanges.deletedFiles) {
+                        const match = deletedFile.match(/_(\d+)\.md$/);
+                        if (match) {
+                            const noteId = parseInt(match[1]);
+                            const noteIndex = mergedNotes.findIndex(note => note.id === noteId);
+                            if (noteIndex !== -1) {
+                                console.log(`🗑️  Removing note deleted from upstream: ${mergedNotes[noteIndex].title}`);
+                                mergedNotes.splice(noteIndex, 1);
+                                deletedCount++;
+                            }
+                        }
+                    }
+
+                    console.log(`✅ Applied upstream changes: ${addedFromRemote} added, ${updatedFromRemote} updated, ${deletedCount} deleted`);
+                } else {
+                    console.log('⏭️  No upstream changes to apply');
+                }
+
+                console.log(`Total notes after incremental sync: ${mergedNotes.length}`);
+
+                // Debug: Log some details about the merged notes
+                if (addedFromRemote > 0 || updatedFromRemote > 0) {
+                    console.log('Merged notes summary:', mergedNotes.map(note => ({
+                        id: note.id,
+                        title: note.title,
+                        editedAt: new Date(note.editedAt).toISOString()
+                    })));
+                }
+
+                // Step 4: Save merged notes back to local storage
+                if (addedFromRemote > 0 || updatedFromRemote > 0 || (incrementalChanges.hasChanges && incrementalChanges.deletedFiles.length > 0)) {
+                    console.log('Saving merged notes to local database...');
+                    await saveNotesToDB(mergedNotes, true);  // Mark as sync operation
+                    console.log('Successfully updated local notes with remote changes');
+                } else if (!incrementalChanges.hasChanges) {
+                    console.log('No remote changes detected, skipping local database update');
+                }
+
+                // Step 5: Push all current notes (merged) to GitHub
+                console.log('Pushing notes to GitHub...');
+
+                // Convert notes to markdown files
+                const noteFiles = mergedNotes.map((note) => {
+                    // Convert note to markdown with frontmatter
+                    const frontmatter = [
+                        '---',
+                        `title: "${escapeYaml(note.title)}"`,
+                        `uniqueId: "${note.id}"`,
+                        `tags: [${note.tags.map(tag => `"${escapeYaml(tag.name)}"`).join(', ')}]`,
+                        `created: "${new Date(note.createdAt).toISOString()}"`,
+                        `modified: "${new Date(note.editedAt).toISOString()}"`,
+                        '---',
+                        ''
+                    ].join('\n');
+
+                    const markdown = frontmatter + note.content;
+                    const filename = sanitizeFilename(note.title) + '_' + note.id + '.md';
+
+                    return {
+                        filename: filename,
+                        content: markdown,
+                        note: note
+                    };
+                });
+
+                // Helper function to sync a single file with retry logic for SHA conflicts
+                async function syncFileWithRetry(noteFile, apiBase, headers, maxRetries = 2) {
+                    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                        try {
+                            console.log(`Syncing file: ${noteFile.filename} (attempt ${attempt + 1})`);
+
+                            // URL encode the filename to handle any special characters
+                            const encodedFilename = encodeURIComponent(noteFile.filename);
+
+                            // Fetch current file info for SHA (fresh each attempt)
+                            let currentSHA = null;
+                            try {
+                                const fileInfoResponse = await fetch(`${apiBase}/contents/${encodedFilename}`, {
+                                    method: 'GET',
+                                    headers: headers
+                                });
+
+                                if (fileInfoResponse.ok) {
+                                    const fileInfo = await fileInfoResponse.json();
+                                    currentSHA = fileInfo.sha;
+                                    console.log(`Got current SHA for ${noteFile.filename}: ${currentSHA}`);
+                                }
+                            } catch (shaError) {
+                                console.log(`File ${noteFile.filename} doesn't exist remotely, creating new file`);
+                            }
+
+                            const requestBody = {
+                                message: `Update note: ${noteFile.note.title}`,
+                                content: btoa(unescape(encodeURIComponent(noteFile.content))) // Base64 encode
+                            };
+
+                            // Add SHA if updating existing file
+                            if (currentSHA) {
+                                requestBody.sha = currentSHA;
+                            }
+
+                            const fileResponse = await fetch(`${apiBase}/contents/${encodedFilename}`, {
+                                method: 'PUT',
+                                headers: headers,
+                                body: JSON.stringify(requestBody)
+                            });
+
+                            if (fileResponse.ok) {
+                                console.log(`Successfully synced: ${noteFile.filename}`);
+                                return true;
+                            } else {
+                                const errorText = await fileResponse.text();
+
+                                // Check if it's a SHA conflict (409 status or hash mismatch error)
+                                if (fileResponse.status === 409 || errorText.includes('sha') || errorText.includes('hash')) {
+                                    console.log(`SHA conflict detected for ${noteFile.filename}, will retry...`);
+                                    if (attempt === maxRetries) {
+                                        console.error(`Failed to sync ${noteFile.filename} after ${maxRetries + 1} attempts: ${errorText}`);
+                                        return false;
+                                    }
+                                    // Wait a bit before retrying to allow for any ongoing changes to settle
+                                    await new Promise(resolve => setTimeout(resolve, 1000));
+                                    continue;
+                                } else {
+                                    console.error(`Failed to sync ${noteFile.filename}:`, errorText);
+                                    return false;
+                                }
+                            }
+                        } catch (error) {
+                            console.error(`Error syncing file ${noteFile.filename} on attempt ${attempt + 1}:`, error);
+                            if (attempt === maxRetries) {
+                                return false;
+                            }
+                            // Wait before retrying
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        }
+                    }
+                    return false;
+                }
+
+                // Push files to repository
+                let syncedCount = 0;
+                const filesToDelete = []; // Initialize array for files to delete (for conflict resolution)
+
+                for (const noteFile of noteFiles) {
+                    const success = await syncFileWithRetry(noteFile, apiBase, headers);
+                    if (success) {
+                        syncedCount++;
+                    }
+
+                    // Add a small delay between requests to avoid rate limiting
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                }
+
+                // Step 6: Delete conflict resolution files
+                if (filesToDelete.length > 0) {
+                    console.log(`Deleting ${filesToDelete.length} conflict resolution files...`);
+                    let deletedCount = 0;
+
+                    for (const filename of filesToDelete) {
+                        try {
+                            console.log("Fetching file " + filename);
+                            // URL encode the filename to handle any special characters
+                            const encodedFilename = encodeURIComponent(filename);
+
+                            // Get the current SHA of the file to delete
+                            const fileInfoResponse = await fetch(`${apiBase}/contents/${encodedFilename}`, {
+                                method: 'GET',
+                                headers: headers
+                            });
+
+                            if (fileInfoResponse.ok) {
+                                const fileInfo = await fileInfoResponse.json();
+                                const currentSHA = fileInfo.sha;
+
+                                // Delete the file
+                                const deleteResponse = await fetch(`${apiBase}/contents/${encodedFilename}`, {
+                                    method: 'DELETE',
+                                    headers: headers,
+                                    body: JSON.stringify({
+                                        message: `Delete conflicted file: ${filename}`,
+                                        sha: currentSHA
+                                    })
+                                });
+
+                                if (deleteResponse.ok) {
+                                    console.log(`Successfully deleted conflict file: ${filename}`);
+                                    deletedCount++;
+                                } else {
+                                    console.error(`Failed to delete ${filename}: ${deleteResponse.status} ${deleteResponse.statusText}`);
+                                }
+                            } else {
+                                console.log(`File ${filename} no longer exists, skipping deletion`);
+                            }
+
+                            // Add delay to avoid rate limiting
+                            await new Promise(resolve => setTimeout(resolve, 200));
+                        } catch (error) {
+                            console.error(`Error deleting file ${filename}:`, error);
+                        }
+                    }
+
+                    console.log(`Deleted ${deletedCount} of ${filesToDelete.length} conflict files`);
+                }
+
+                return `Successfully synced ${syncedCount} of ${noteFiles.length} notes. Added ${addedFromRemote} notes from repository. Updated ${updatedFromRemote} existing notes from repository.${filesToDelete.length > 0 ? ` Cleaned up ${filesToDelete.length} conflict files.` : ''}`;
+
+            } catch (error) {
+                console.error('GitHub sync error:', error);
+                throw new Error('GitHub sync failed: ' + error.message);
+            }
+        }
+
+        // Helper function to escape YAML strings
+        function escapeYaml(str) {
+            return str.replace(/"/g, '\\"').replace(/\n/g, '\\n');
+        }
+
+        // Function to parse markdown frontmatter and extract note data
+        function parseMarkdownNote(content, filename) {
+            try {
+                const lines = content.split('\n');
+                if (lines[0] !== '---') {
+                    return null; // No frontmatter
+                }
+
+                let frontmatterEnd = -1;
+                for (let i = 1; i < lines.length; i++) {
+                    if (lines[i] === '---') {
+                        frontmatterEnd = i;
+                        break;
+                    }
+                }
+
+                if (frontmatterEnd === -1) {
+                    return null; // Malformed frontmatter
+                }
+
+                // Parse frontmatter
+                const frontmatterLines = lines.slice(1, frontmatterEnd);
+                const metadata = {};
+
+                for (const line of frontmatterLines) {
+                    const colonIndex = line.indexOf(':');
+                    if (colonIndex > 0) {
+                        const key = line.substring(0, colonIndex).trim();
+                        const value = line.substring(colonIndex + 1).trim().replace(/^"(.*)"$/, '$1');
+                        metadata[key] = value;
+                    }
+                }
+
+                // Extract content after frontmatter
+                const noteContent = lines.slice(frontmatterEnd + 1).join('\n').trim();
+
+                // Parse tags if they exist
+                let tags = [];
+                if (metadata.tags) {
+                    // Remove brackets and split by comma
+                    const tagString = metadata.tags.replace(/[\[\]]/g, '');
+                    if (tagString.trim()) {
+                        tags = tagString.split(',').map(tag => ({
+                            name: tag.trim().replace(/^"(.*)"$/, '$1')
+                        }));
+                    }
+                }
+
+                return {
+                    id: parseInt(metadata.uniqueId) || Date.now(),
+                    title: metadata.title || 'Untitled',
+                    content: noteContent,
+                    createdAt: metadata.created ? new Date(metadata.created).getTime() : Date.now(),
+                    editedAt: metadata.modified ? new Date(metadata.modified).getTime() : (metadata.created ? new Date(metadata.created).getTime() : Date.now()),
+                    tags: tags
+                };
+
+            } catch (error) {
+                console.error('Error parsing markdown note:', error);
+                return null;
+            }
+        }
+
+        // Function to pull notes from GitHub repository
+        async function pullNotesFromGitHub(config) {
+            try {
+                const url = new URL(config.repositoryUrl);
+                const pathParts = url.pathname.split('/').filter(part => part.length > 0);
+
+                if (pathParts.length < 2) {
+                    throw new Error('Invalid repository URL format');
+                }
+
+                const owner = pathParts[0];
+                const repo = pathParts[1];
+                const apiBase = `https://api.github.com/repos/${owner}/${repo}`;
+
+                const headers = {
+                    'Authorization': getAuthorizationHeader(config.personalAccessToken),
+                    'Accept': 'application/vnd.github+json',
+                    'X-GitHub-Api-Version': '2022-11-28'
+                };
+
+                console.log(`Attempting to fetch contents from: ${apiBase}/contents`);
+
+                // First, check if the repository exists by fetching repo info
+                try {
+                    const repoResponse = await fetch(apiBase, {
+                        method: 'GET',
+                        headers: headers
+                    });
+
+                    if (!repoResponse.ok) {
+                        if (repoResponse.status === 404) {
+                            throw new Error(`Repository '${owner}/${repo}' not found. Please check the repository URL.`);
+                        } else if (repoResponse.status === 403) {
+                            throw new Error(`Access denied to repository '${owner}/${repo}'. Please check your token permissions.`);
+                        }
+                        throw new Error(`Failed to access repository: ${repoResponse.status}`);
+                    }
+                    console.log(`Repository ${owner}/${repo} exists and is accessible`);
+                } catch (repoError) {
+                    throw new Error(`Repository access failed: ${repoError.message}`);
+                }
+
+                // Fetch repository contents
+                const contentsResponse = await fetch(`${apiBase}/contents`, {
+                    method: 'GET',
+                    headers: headers
+                });
+
+                if (!contentsResponse.ok) {
+                    if (contentsResponse.status === 403) {
+                        throw new Error(`Access denied. Please ensure your token has 'Contents' repository permissions.`);
+                    } else if (contentsResponse.status === 404) {
+                        // Repository exists but is empty or path doesn't exist - this is okay for first sync
+                        console.log('Repository appears to be empty - treating as no existing notes');
+                        return [];
+                    }
+                    throw new Error(`Failed to fetch repository contents: ${contentsResponse.status}`);
+                }
+
+                const files = await contentsResponse.json();
+                const markdownFiles = files.filter(file => file.name.endsWith('.md') && file.type === 'file');
+
+                console.log(`Found ${markdownFiles.length} markdown files in repository`);
+
+                // Fetch content of each markdown file
+                const remoteNotes = [];
+                for (const file of markdownFiles) {
+                    try {
+                        // URL encode the file path to handle any special characters
+                        const encodedFilePath = encodeURIComponent(file.path);
+
+                        // For private repositories, we need to use the API endpoint with authentication
+                        // instead of the raw download_url which may not work for private repos
+                        const fileContentResponse = await fetch(`${apiBase}/contents/${encodedFilePath}`, {
+                            method: 'GET',
+                            headers: headers
+                        });
+
+                        if (fileContentResponse.ok) {
+                            const fileData = await fileContentResponse.json();
+                            // GitHub API returns base64 encoded content
+                            try {
+                                const content = atob(fileData.content.replace(/\s/g, ''));
+                                const note = parseMarkdownNote(content, file.name);
+                                if (note) {
+                                    remoteNotes.push(note);
+                                }
+                            } catch (decodeError) {
+                                console.error(`Failed to decode content for ${file.name}:`, decodeError);
+                            }
+                        } else {
+                            console.error(`Failed to fetch content for ${file.name}: ${fileContentResponse.status}`);
+                        }
+                    } catch (error) {
+                        console.error(`Error fetching file ${file.name}:`, error);
+                    }
+                }
+
+                return remoteNotes;
+
+            } catch (error) {
+                console.error('Error pulling notes from GitHub:', error);
+                throw error;
+            }
+        }
+
+        // Function to perform force pull - delete all local notes and recreate from remote repository
+        async function performForcePullFromGitHub(config) {
+            try {
+                console.log('Starting force pull from GitHub repository:', config.repositoryUrl);
+
+                // Security check: Verify we're working with a decrypted token for sync
+                if (config.personalAccessToken && isTokenEncrypted(config.personalAccessToken)) {
+                    throw new Error('Cannot sync with encrypted token - token must be decrypted for API calls');
+                }
+
+                // Reminder: This token is temporarily decrypted ONLY for this operation
+                console.log('🔒 Using temporarily decrypted token for force pull (will not be saved)');
+
+                // Step 1: Pull all notes from GitHub
+                console.log('Pulling notes from GitHub...');
+                let remoteNotes = [];
+                try {
+                    remoteNotes = await pullNotesFromGitHub(config);
+                    console.log(`Successfully pulled ${remoteNotes.length} notes from GitHub`);
+                } catch (error) {
+                    console.log('No existing notes found in repository or error pulling:', error.message);
+                    // For empty repositories, we'll just clear local notes
+                    remoteNotes = [];
+                }
+
+                // Step 2: Clear all local notes (delete everything)
+                console.log('Clearing all local notes...');
+                try {
+                    await saveNotesToDB([], true);  // Mark as sync operation
+                    console.log('Local notes cleared successfully');
+                } catch (error) {
+                    console.error('Failed to clear local notes:', error);
+                    throw new Error('Force pull failed: Unable to clear local notes - ' + error.message);
+                }
+
+                // Step 3: Save the remote notes as local notes (recreate everything from remote)
+                if (remoteNotes.length > 0) {
+                    console.log(`Saving ${remoteNotes.length} notes from remote repository...`);
+                    try {
+                        await saveNotesToDB(remoteNotes, true);  // Mark as sync operation
+                        console.log('Successfully recreated all notes from remote repository');
+                    } catch (error) {
+                        console.error('Failed to save remote notes:', error);
+                        throw new Error('Force pull failed: Unable to save remote notes - ' + error.message);
+                    }
+                } else {
+                    console.log('No notes found in remote repository - local storage is now empty');
+                }
+
+                // Step 4: Clear all action events since we've just done a complete reset
+                console.log('Clearing action events after force pull...');
+                localStorage.removeItem('notez-action-events');
+                localStorage.removeItem('notez-action-count');
+
+                // Step 5: Get the current remote HEAD to return as the sync reference
+                let finalRemoteRef = null;
+                try {
+                    console.log('🔄 Getting current remote HEAD after force pull...');
+                    finalRemoteRef = await getLatestCommitSha(config.repositoryUrl, config.personalAccessToken, 'main', true);
+                    console.log(`✅ Current remote HEAD: ${finalRemoteRef}`);
+                } catch (error) {
+                    console.warn('⚠️  Could not get current remote HEAD after force pull:', error.message);
+                    // For force pull, we don't have a fallback since we didn't make any commits
+                    finalRemoteRef = null;
+                }
+
+                // Return success message
+                const message = remoteNotes.length > 0
+                    ? `Force pull completed: Deleted all local notes and recreated ${remoteNotes.length} notes from repository`
+                    : 'Force pull completed: Deleted all local notes (remote repository is empty)';
+
+                return {
+                    message: message,
+                    commitSha: finalRemoteRef, // Return the current remote HEAD as the sync reference
+                    updatedNotes: remoteNotes // Return the notes so caller can notify about updates
+                };
+
+            } catch (error) {
+                console.error('Force pull from GitHub failed:', error);
+                throw new Error('Force pull failed: ' + error.message);
+            }
+        }
+
+        // New function to perform GitHub sync with incremental updates based on action events
+        async function performGitHubSyncWithEvents(syncData) {
+            try {
+                const config = syncData.config;
+                const actionEvents = syncData.actionEvents || [];
+
+                console.log('Starting incremental GitHub sync with repository:', config.repositoryUrl);
+                console.log(`Found ${actionEvents.length} action events to process`);
+                console.log('Action events received:', actionEvents);
+
+                // Security check: Verify we're working with a decrypted token for sync
+                if (config.personalAccessToken && isTokenEncrypted(config.personalAccessToken)) {
+                    throw new Error('Cannot sync with encrypted token - token must be decrypted for API calls');
+                }
+
+                // Reminder: This token is temporarily decrypted ONLY for this sync operation
+                // It should NEVER be saved back to storage in this state
+                console.log('🔒 Using temporarily decrypted token for sync (will not be saved)');
+
+                // Extract owner and repo from URL
+                const url = new URL(config.repositoryUrl);
+                const pathParts = url.pathname.split('/').filter(part => part.length > 0);
+
+                if (pathParts.length < 2) {
+                    throw new Error('Invalid repository URL format');
+                }
+
+                const owner = pathParts[0];
+                const repo = pathParts[1];
+                const apiBase = `https://api.github.com/repos/${owner}/${repo}`;
+
+                // Headers for GitHub API
+                const headers = {
+                    'Authorization': getAuthorizationHeader(config.personalAccessToken),
+                    'Accept': 'application/vnd.github+json',
+                    'X-GitHub-Api-Version': '2022-11-28',
+                    'Content-Type': 'application/json'
+                };
+
+                // Track updated notes for editor refresh notifications
+                const updatedNoteIds = [];                // Step 1: Always get the current remote HEAD first for proper comparison
+                let currentRemoteRef = null;
+                let hasRemoteChanges = false;
+
+                try {
+                    console.log('🔍 Fetching current remote HEAD for comparison...');
+                    currentRemoteRef = await getLatestCommitSha(config.repositoryUrl, config.personalAccessToken, 'main', true);
+                    console.log(`📍 Current remote HEAD: ${currentRemoteRef}`);
+
+                    // Compare with lastSyncRef to determine if there are remote changes
+                    if (config.lastSyncRef && config.lastSyncRef !== currentRemoteRef) {
+                        console.log(`🔄 Remote changes detected: ${config.lastSyncRef} -> ${currentRemoteRef}`);
+                        hasRemoteChanges = true;
+                    } else if (!config.lastSyncRef) {
+                        console.log('📝 No previous sync reference, treating as initial sync');
+                        hasRemoteChanges = true; // First sync
+                    } else {
+                        console.log('✅ No remote changes detected');
+                        hasRemoteChanges = false;
+                    }
+                } catch (error) {
+                    console.warn('⚠️  Could not check remote changes:', error.message);
+                    hasRemoteChanges = true; // Assume changes if we can't check
+                }
+
+                // Step 2: Check for incremental remote changes (if any)
+                console.log('🚀 Checking for incremental changes from remote...');
+                let incrementalChanges = { changedNotes: [], deletedFiles: [], hasChanges: false };
+
+                if (hasRemoteChanges) {
+                    try {
+                        // Use incremental sync to get only the remote changes
+                        incrementalChanges = await fetchChangedNotesSinceLastSync(config);
+                        console.log(`✅ Incremental sync result: ${incrementalChanges.changedNotes.length} changed notes, ${incrementalChanges.deletedFiles.length} deleted files`);
+                    } catch (error) {
+                        console.error('❌ Incremental sync failed:', error.message);
+                        // Fall back to empty changes rather than failing completely
+                        incrementalChanges = { changedNotes: [], deletedFiles: [], hasChanges: false };
+                        hasRemoteChanges = false;
+                        console.warn('⚠️  Continuing sync without remote changes due to incremental sync failure');
+                    }
+                } else {
+                    console.log('✅ No remote changes, proceeding with local sync only');
+                }
+
+                // Step 3: Apply incremental changes to local notes if any changes were found
+                if (incrementalChanges.hasChanges) {
+                    console.log('📥 Applying incremental changes to local notes...');
+                    const localNotes = await loadNotesFromDB();
+                    const mergedNotes = [...localNotes];
+                    let addedFromRemote = 0;
+                    let updatedFromRemote = 0;
+
+                    // Process changed/added notes from upstream
+                    for (const remoteNote of incrementalChanges.changedNotes) {
+                        const localNoteIndex = mergedNotes.findIndex(local => local.id === remoteNote.id);
+
+                        if (localNoteIndex === -1) {
+                            // Note doesn't exist locally, add it
+                            mergedNotes.push({ ...remoteNote });
+                            addedFromRemote++;
+                            updatedNoteIds.push(remoteNote.id); // Track this note as added
+                            console.log(`➕ Added new note from upstream: ${remoteNote.title}`);
+                        } else {
+                            // Note exists locally, check if remote version is newer
+                            const localNote = mergedNotes[localNoteIndex];
+                            
+                            // Ensure proper timestamp comparison by converting to numbers
+                            const remoteTimestamp = Number(remoteNote.editedAt);
+                            const localTimestamp = Number(localNote.editedAt);
+                            
+                            if (remoteTimestamp > localTimestamp) {
+                                mergedNotes[localNoteIndex] = { ...remoteNote };
+                                updatedFromRemote++;
+                                updatedNoteIds.push(remoteNote.id); // Track this note as updated
+                                console.log(`🔄 Updated note from upstream: ${remoteNote.title} (remote: ${remoteTimestamp} > local: ${localTimestamp})`);
+                            } else {
+                                console.log(`⏭️  Skipped older remote version: ${remoteNote.title} (remote: ${remoteTimestamp} <= local: ${localTimestamp})`);
+                            }
+                        }
+                    }
+
+                    // Process deleted files from upstream
+                    let deletedCount = 0;
+                    for (const deletedFile of incrementalChanges.deletedFiles) {
+                        const match = deletedFile.match(/_(\d+)\.md$/);
+                        if (match) {
+                            const noteId = parseInt(match[1]);
+                            const noteIndex = mergedNotes.findIndex(note => note.id === noteId);
+                            if (noteIndex !== -1) {
+                                console.log(`🗑️  Removing note deleted from upstream: ${mergedNotes[noteIndex].title}`);
+                                mergedNotes.splice(noteIndex, 1);
+                                deletedCount++;
+                            }
+                        }
+                    }
+
+                    console.log(`✅ Applied incremental changes: ${addedFromRemote} added, ${updatedFromRemote} updated, ${deletedCount} deleted`);
+                    // Save merged notes if there were any changes
+                    if (addedFromRemote > 0 || updatedFromRemote > 0 || deletedCount > 0) {
+                        console.log('💾 Saving merged notes to local database...');
+                        await saveNotesToDB(mergedNotes, true);  // Mark as sync operation
+                        console.log('✅ Successfully updated local notes with incremental changes');
+                    }
+                } else {
+                    console.log('✅ No incremental changes to apply - repository is up to date');
+                }
+
+                // Step 4: Load current local notes for action event processing
+                const currentNotes = await loadNotesFromDB();
+                console.log(`Found ${currentNotes.length} local notes for action event processing`);
+
+                // Step 5: Process all action events from the list
+                console.log(`Processing ${actionEvents.length} action events from the list`);
+
+                // Log the events for debugging
+                if (actionEvents.length > 0) {
+                    console.log('Action events to process:', actionEvents.map(event => ({
+                        type: event.actionType,
+                        noteId: event.noteId,
+                        title: event.noteTitle,
+                        timestamp: new Date(event.timestamp).toISOString()
+                    })));
+                }
+
+                // Step 6: Process action events into filesystem operations
+                const operations = await translateEventsToFileOperations(actionEvents, currentNotes);
+                console.log(`Generated ${operations.length} filesystem operations from action events`);
+
+                // Log the operations for debugging
+                if (operations.length > 0) {
+                    console.log('Filesystem operations to execute:', operations.map(op => ({
+                        type: op.type,
+                        filename: op.filename,
+                        message: op.message
+                    })));
+                }
+
+                // Step 7: Execute filesystem operations on GitHub
+                let successCount = 0;
+                let latestCommitSha = null; // Track the latest commit SHA from our operations
+                for (const operation of operations) {
+                    try {
+                        console.log(`Executing ${operation.type} operation: ${operation.filename}`);
+                        const result = await executeGitHubOperation(operation, apiBase, headers);
+                        if (result.success) {
+                            successCount++;
+                            console.log(`✓ Operation ${operation.type} completed successfully for ${operation.filename}`);
+                            // Update the latest commit SHA if one was returned
+                            if (result.commitSha) {
+                                latestCommitSha = result.commitSha;
+                            }
+                        } else {
+                            console.error(`✗ Operation ${operation.type} failed for ${operation.filename}`);
+                        }
+
+                        // Add delay between operations to avoid rate limiting
+                        if (operations.length > 1) {
+                            await new Promise(resolve => setTimeout(resolve, 300));
+                        }
+                    } catch (error) {
+                        console.error(`Failed to execute operation ${operation.type} for ${operation.filename}:`, error);
+                    }
+                }
+
+                console.log(`Successfully executed ${successCount}/${operations.length} filesystem operations`);
+
+                // Step 8: CRITICAL - Set lastSyncRef according to what we actually did
+                // When we push local changes, use the last ref we pushed ourselves
+                // When we only pull remote changes, use the head ref we are pulling from
+                let finalRemoteRef = null;
+
+                if (successCount > 0) {
+                    // We pushed local changes - use the last commit SHA we pushed ourselves
+                    if (latestCommitSha) {
+                        finalRemoteRef = latestCommitSha;
+                        console.log(`✅ Using last pushed commit SHA as final sync reference: ${finalRemoteRef}`);
+                    } else {
+                        console.warn("⚠️  No commit SHA available from push operations");
+                        // Fallback to current remote ref
+                        finalRemoteRef = currentRemoteRef;
+                    }
+                } else {
+                    // We only pulled remote changes (or no changes at all)
+                    // Use the remote HEAD ref we pulled from
+                    finalRemoteRef = currentRemoteRef;
+                    console.log(`✅ Using remote HEAD ref as final sync reference: ${finalRemoteRef}`);
+                }
+
+                // Step 9: Skip full sync - we already handled remote changes with incremental sync
+                // The incremental sync in Step 2 already pulled any upstream changes efficiently
+                console.log('✅ Sync complete - incremental sync already handled all remote changes, no full sync needed');
+
+                // Prepare result message
+                let resultMessage = `Sync completed: ${successCount}/${operations.length} local operations executed successfully`;
+
+                // Add information about remote changes if any were processed
+                if (hasRemoteChanges) {
+                    resultMessage += `. Remote changes were pulled and applied to local notes`;
+                } else {
+                    resultMessage += `. No remote changes detected`;
+                }
+
+                // Return both the message and the final remote ref to save as lastSyncRef
+                return {
+                    message: resultMessage,
+                    latestCommitSha: finalRemoteRef, // This is the ref we should save for the next sync
+                    updatedNoteIds: updatedNoteIds // Return the list of note IDs that were updated during sync
+                };
+
+            } catch (error) {
+                console.error('GitHub sync with events failed:', error);
+                throw error;
+            }
+        }
+
+        // Helper function to merge local notes with remote notes
+        async function mergeNotesWithRemote(localNotes, remoteNotes) {
+            const mergedNotes = [...localNotes];
+            let hasChanges = false;
+            let addedFromRemote = 0;
+            let updatedFromRemote = 0;
+            const updatedNoteIds = []; // Track which notes were updated for editor refresh
+
+            for (const remoteNote of remoteNotes) {
+                const localNoteIndex = mergedNotes.findIndex(local => local.id === remoteNote.id);
+
+                if (localNoteIndex === -1) {
+                    // Note doesn't exist locally, add it
+                    mergedNotes.push({ ...remoteNote });
+                    addedFromRemote++;
+                    hasChanges = true;
+                } else {
+                    // Note exists locally, check if remote version is newer
+                    const localNote = mergedNotes[localNoteIndex];
+
+                    // Ensure proper timestamp comparison by converting to numbers
+                    const remoteTimestamp = Number(remoteNote.editedAt);
+                    const localTimestamp = Number(localNote.editedAt);
+
+                    if (remoteTimestamp > localTimestamp) {
+                        // Remote version is newer, update local note
+                        console.log(`Updating local note "${localNote.title}" with newer remote version (remote: ${remoteTimestamp} > local: ${localTimestamp})`);
+                        mergedNotes[localNoteIndex] = { ...remoteNote };
+                        updatedFromRemote++;
+                        updatedNoteIds.push(remoteNote.id); // Track this note as updated
+                        hasChanges = true;
+                    } else {
+                        console.log(`Keeping local note "${localNote.title}" (remote: ${remoteTimestamp} <= local: ${localTimestamp})`);
+                    }
+                }
+            }
+
+            console.log(`Merge results: ${addedFromRemote} added, ${updatedFromRemote} updated from remote`);
+            return { notes: mergedNotes, hasChanges, updatedNoteIds };
+        }
+
+        // Helper function to translate action events into filesystem operations
+        async function translateEventsToFileOperations(actionEvents, currentNotes) {
+            const operations = [];
+            const processedNotes = new Set(); // Track notes we've already processed
+
+            for (const event of actionEvents) {
+                // Skip if we've already processed this note in a later event
+                if (processedNotes.has(event.noteId)) {
+                    continue;
+                }
+
+                const note = currentNotes.find(n => n.id === event.noteId);
+
+                switch (event.actionType) {
+                    case 'added':
+                        if (note) {
+                            operations.push({
+                                type: 'create',
+                                filename: sanitizeFilename(note.title) + '_' + note.id + '.md',
+                                note: note,
+                                message: `Add note: ${note.title}`
+                            });
+                        }
+                        break;
+
+                    case 'updated':
+                        if (note) {
+                            operations.push({
+                                type: 'update',
+                                filename: sanitizeFilename(note.title) + '_' + note.id + '.md',
+                                note: note,
+                                message: `Update note: ${note.title}`
+                            });
+                        }
+                        break;
+
+                    case 'deleted':
+                        // For deleted notes, we need to find the filename from the event title
+                        const deletedFilename = sanitizeFilename(event.noteTitle) + '_' + event.noteId + '.md';
+                        operations.push({
+                            type: 'delete',
+                            filename: deletedFilename,
+                            message: `Delete note: ${event.noteTitle}`
+                        });
+                        break;
+
+                    case 'renamed':
+                        if (note) {
+                            // For renames, use the stored old filename if available
+                            let oldFilename;
+                            if (event.oldFilename) {
+                                // Use the stored old filename from the action event
+                                oldFilename = event.oldFilename;
+                            } else {
+                                // Fallback: use the event title as the old title (for backwards compatibility)
+                                oldFilename = sanitizeFilename(event.noteTitle) + '_' + event.noteId + '.md';
+                            }
+
+                            const newFilename = sanitizeFilename(note.title) + '_' + note.id + '.md';
+
+                            if (oldFilename !== newFilename) {
+                                operations.push({
+                                    type: 'delete',
+                                    filename: oldFilename,
+                                    message: `Rename: delete old file ${oldFilename}`
+                                });
+                                operations.push({
+                                    type: 'create',
+                                    filename: newFilename,
+                                    note: note,
+                                    message: `Rename: create new file ${note.title}`
+                                });
+                            }
+                        }
+                        break;
+                }
+
+                processedNotes.add(event.noteId);
+            }
+
+            return operations;
+        }
+
+        // Helper function to execute a single GitHub operation
+        async function executeGitHubOperation(operation, apiBase, headers) {
+            try {
+                const encodedFilename = encodeURIComponent(operation.filename);
+
+                if (operation.type === 'delete') {
+                    // Get file SHA first
+                    try {
+                        const fileInfoResponse = await fetch(`${apiBase}/contents/${encodedFilename}`, {
+                            method: 'GET',
+                            headers: headers
+                        });
+
+                        if (fileInfoResponse.ok) {
+                            const fileInfo = await fileInfoResponse.json();
+
+                            // Delete the file
+                            const deleteResponse = await fetch(`${apiBase}/contents/${encodedFilename}`, {
+                                method: 'DELETE',
+                                headers: headers,
+                                body: JSON.stringify({
+                                    message: operation.message,
+                                    sha: fileInfo.sha
+                                })
+                            });
+
+                            if (deleteResponse.ok) {
+                                console.log(`Successfully deleted: ${operation.filename}`);
+                                const responseData = await deleteResponse.json();
+                                return { success: true, commitSha: responseData.commit?.sha };
+                            } else {
+                                console.error(`Failed to delete ${operation.filename}: ${deleteResponse.status}`);
+                                return { success: false };
+                            }
+                        } else {
+                            console.log(`File ${operation.filename} doesn't exist remotely, skipping delete`);
+                            return { success: true }; // Consider this a success but no commit SHA
+                        }
+                    } catch (error) {
+                        console.error(`Error deleting file ${operation.filename}:`, error);
+                        return { success: false };
+                    }
+
+                } else if (operation.type === 'create' || operation.type === 'update') {
+                    // Convert note to markdown
+                    const frontmatter = [
+                        '---',
+                        `title: "${escapeYaml(operation.note.title)}"`,
+                        `uniqueId: "${operation.note.id}"`,
+                        `tags: [${operation.note.tags.map(tag => `"${escapeYaml(tag.name)}"`).join(', ')}]`,
+                        `created: "${new Date(operation.note.createdAt).toISOString()}"`,
+                        `modified: "${new Date(operation.note.editedAt).toISOString()}"`,
+                        '---',
+                        ''
+                    ].join('\n');
+
+                    const markdown = frontmatter + operation.note.content;
+
+                    // Get current SHA if updating
+                    let currentSHA = null;
+                    if (operation.type === 'update') {
+                        try {
+                            const fileInfoResponse = await fetch(`${apiBase}/contents/${encodedFilename}`, {
+                                method: 'GET',
+                                headers: headers
+                            });
+
+                            if (fileInfoResponse.ok) {
+                                const fileInfo = await fileInfoResponse.json();
+                                currentSHA = fileInfo.sha;
+                            }
+                        } catch (shaError) {
+                            console.log(`File ${operation.filename} doesn't exist remotely, creating new file`);
+                        }
+                    }
+
+                    const requestBody = {
+                        message: operation.message,
+                        content: btoa(unescape(encodeURIComponent(markdown))) // Base64 encode
+                    };
+
+                    if (currentSHA) {
+                        requestBody.sha = currentSHA;
+                    }
+
+                    const fileResponse = await fetch(`${apiBase}/contents/${encodedFilename}`, {
+                        method: 'PUT',
+                        headers: headers,
+                        body: JSON.stringify(requestBody)
+                    });
+
+                    if (fileResponse.ok) {
+                        console.log(`Successfully ${operation.type}d: ${operation.filename}`);
+                        const responseData = await fileResponse.json();
+                        return { success: true, commitSha: responseData.commit?.sha };
+                    } else {
+                        const errorText = await fileResponse.text();
+                        console.error(`Failed to ${operation.type} ${operation.filename}:`, errorText);
+                        return { success: false };
+                    }
+                }
+
+                return { success: false };
+
+            } catch (error) {
+                console.error(`Error executing ${operation.type} operation for ${operation.filename}:`, error);
+                return { success: false };
+            }
+        }
+
+        // Function to deduplicate action events based on the rules
+        function deduplicateActionEvents(events, newActionEvent, newActionType, noteId) {
+            const filteredEvents = [];
+            let hasCreateAction = false;
+            let renameAction = null;
+
+            // First pass: identify if there's a create action or rename action for this note
+            for (const event of events) {
+                if (event.noteId === noteId) {
+                    if (event.actionType === 'added') {
+                        hasCreateAction = true;
+                    } else if (event.actionType === 'renamed') {
+                        renameAction = event;
+                    }
+                }
+            }
+
+            for (const event of events) {
+                let shouldKeep = true;
+
+                // Only consider events for the same note
+                if (event.noteId === noteId) {
+                    if (newActionType === 'deleted') {
+                        if (hasCreateAction && event.actionType === 'added') {
+                            // Rule 2: If a note has a create action and is deleted, remove the create action
+                            shouldKeep = false;
+                            console.log(`Deduplication: Removing create action for note ${noteId} because it was deleted`);
+                        } else if (renameAction && event.actionType === 'renamed') {
+                            // Rule 4: If a note is renamed and then deleted, remove the rename action
+                            // and we'll create a delete action with the original filename
+                            shouldKeep = false;
+                            console.log(`Deduplication: Removing rename action for note ${noteId} because it was deleted`);
+
+                            // Modify the new delete action to use the original filename
+                            if (event.oldFilename) {
+                                newActionEvent.noteTitle = event.noteTitle; // Use the original title from rename
+                                newActionEvent.oldFilename = event.oldFilename;
+                            }
+                        }
+                    } else if (newActionType === 'updated') {
+                        if (hasCreateAction) {
+                            // Rule 1: When a note has a create action, do not add any modified action types
+                            // Don't add this update action at all - return early without adding
+                            console.log(`Deduplication: Blocking update action for note ${noteId} because it has a create action`);
+                            return events; // Return original events without adding the new action
+                        } else if (event.actionType === 'updated') {
+                            // Rule 2: If a note is edited multiple times, remove previous edit actions
+                            shouldKeep = false;
+                            console.log(`Deduplication: Removing previous edit action for note ${noteId}`);
+                        }
+                    } else if (newActionType === 'renamed') {
+                        if (hasCreateAction) {
+                            // Rule 3: When a note is renamed, do not create modification actions for it
+                            // But we still allow the rename if there's a create action
+                            if (event.actionType === 'updated') {
+                                shouldKeep = false;
+                                console.log(`Deduplication: Removing update action for note ${noteId} because it was renamed`);
+                            }
+                        } else if (event.actionType === 'updated') {
+                            // Rule 3: If a note is renamed, remove previous edit actions
+                            shouldKeep = false;
+                            console.log(`Deduplication: Removing previous edit action for note ${noteId} because it was renamed`);
+                        } else if (event.actionType === 'renamed') {
+                            // Remove previous rename actions
+                            shouldKeep = false;
+                            console.log(`Deduplication: Removing previous rename action for note ${noteId}`);
+                        }
+                    }
+                }
+
+                if (shouldKeep) {
+                    filteredEvents.push(event);
+                }
+            }
+
+            return filteredEvents;
+        }
+
+        // ==============================
+        // LEGACY SETUP DETECTION & CLEANUP
+        // TODO: Remove this section after legacy migration is complete
+        // ==============================
+
+        /**
+         * Detects and clears legacy setup data that may be incompatible with security improvements
+         * This function will be removed after the legacy migration period
+         */
+        async function detectAndClearLegacySetup() {
+            console.log('🔍 Checking for legacy setup...');
+
+            let hasLegacySetup = false;
+            const legacyReasons = [];
+
+            try {
+                // Check 1: Detect unencrypted GitHub tokens in localStorage
+                const legacyGitHubConfigs = [
+                    'notez-github-config',
+                    'notez-github-config-full',
+                    'github-config',
+                    'notez-github-repository-url',
+                    'notez-github-token'
+                ];
+
+                for (const key of legacyGitHubConfigs) {
+                    const value = localStorage.getItem(key);
+                    if (value) {
+                        try {
+                            // If it's a JSON config, check if token is unencrypted
+                            if (key.includes('config')) {
+                                const config = JSON.parse(value);
+                                if (config.personalAccessToken && !isTokenEncrypted(config.personalAccessToken)) {
+                                    hasLegacySetup = true;
+                                    legacyReasons.push(`Unencrypted GitHub token found in ${key}`);
+                                }
+                            } else if (key.includes('token')) {
+                                // Direct token storage (legacy)
+                                if (value.startsWith('ghp_') || value.startsWith('github_pat_')) {
+                                    hasLegacySetup = true;
+                                    legacyReasons.push(`Plain text GitHub token found in ${key}`);
+                                }
+                            }
+                        } catch (e) {
+                            // If JSON parsing fails, might be legacy format
+                            if (key.includes('config')) {
+                                hasLegacySetup = true;
+                                legacyReasons.push(`Legacy config format detected in ${key}`);
+                            }
+                        }
+                    }
+                }
+
+                // Check 2: Detect old database structure (before security improvements)
+                if (db) {
+                    try {
+                        const transaction = db.transaction([CONFIG_STORE_NAME], 'readonly');
+                        const configStore = transaction.objectStore(CONFIG_STORE_NAME);
+                        const configRequest = configStore.get('security-version');
+
+                        configRequest.onsuccess = function () {
+                            if (!configRequest.result) {
+                                hasLegacySetup = true;
+                                legacyReasons.push('No security version marker found in database');
+                            }
+                        };
+                    } catch (e) {
+                        // If config store doesn't exist, it's definitely legacy
+                        hasLegacySetup = true;
+                        legacyReasons.push('Legacy database structure detected');
+                    }
+                }
+
+                // Check 3: Detect missing security features
+                const securityMarkers = [
+                    'notez-security-initialized',
+                    'notez-encryption-enabled'
+                ];
+
+                for (const marker of securityMarkers) {
+                    if (!localStorage.getItem(marker)) {
+                        hasLegacySetup = true;
+                        legacyReasons.push(`Missing security marker: ${marker}`);
+                    }
+                }
+
+                // If legacy setup detected, perform cleanup
+                if (hasLegacySetup) {
+                    console.log('⚠️  Legacy setup detected:', legacyReasons);
+                    console.log('🧹 Clearing legacy data for security upgrade...');
+
+                    await clearLegacyData();
+
+                    // Set security markers to prevent future cleanup
+                    localStorage.setItem('notez-security-initialized', 'true');
+                    localStorage.setItem('notez-encryption-enabled', 'true');
+
+                    // Mark security version in database
+                    if (db) {
+                        try {
+                            const transaction = db.transaction([CONFIG_STORE_NAME], 'readwrite');
+                            const configStore = transaction.objectStore(CONFIG_STORE_NAME);
+                            await configStore.put({
+                                key: 'security-version',
+                                value: '1.0.0',
+                                timestamp: Date.now()
+                            });
+                        } catch (e) {
+                            console.error('Failed to set security version marker:', e);
+                        }
+                    }
+
+                    console.log('✅ Legacy data cleared successfully');
+                    console.log('ℹ️  Note: You may need to reconfigure your GitHub settings');
+                } else {
+                    console.log('✅ No legacy setup detected');
+                }
+
+            } catch (error) {
+                console.error('Error during legacy setup detection:', error);
+                // Continue with app initialization even if detection fails
+            }
+        }
+
+        /**
+         * Clears all legacy data that may be incompatible with security improvements
+         */
+        async function clearLegacyData() {
+            console.log('🧹 Clearing legacy data...');
+
+            try {
+                // Clear all potentially legacy localStorage items
+                const legacyKeys = [
+                    'notez-github-config',
+                    'notez-github-config-full',
+                    'github-config',
+                    'notez-github-repository-url',
+                    'notez-github-token',
+                    'notez-sync-config',
+                    'notez-notes', // Old notes storage
+                    'notez-tags'   // Old tags storage
+                ];
+
+                for (const key of legacyKeys) {
+                    if (localStorage.getItem(key)) {
+                        localStorage.removeItem(key);
+                        console.log(`  Removed legacy localStorage item: ${key}`);
+                    }
+                }
+
+                // Clear IndexedDB completely to ensure clean slate
+                if (db) {
+                    const transaction = db.transaction([STORE_NAME, CONFIG_STORE_NAME], 'readwrite');
+                    const notesStore = transaction.objectStore(STORE_NAME);
+                    const configStore = transaction.objectStore(CONFIG_STORE_NAME);
+
+                    await new Promise((resolve, reject) => {
+                        const clearNotes = notesStore.clear();
+                        const clearConfig = configStore.clear();
+
+                        let completed = 0;
+                        const onComplete = () => {
+                            completed++;
+                            if (completed === 2) resolve();
+                        };
+
+                        clearNotes.onsuccess = onComplete;
+                        clearNotes.onerror = reject;
+                        clearConfig.onsuccess = onComplete;
+                        clearConfig.onerror = reject;
+                    });
+
+                    console.log('  Cleared IndexedDB stores');
+                }
+
+                // Clear any cached data
+                if ('caches' in window) {
+                    try {
+                        const cacheNames = await caches.keys();
+                        for (const name of cacheNames) {
+                            await caches.delete(name);
+                            console.log(`  Cleared cache: ${name}`);
+                        }
+                    } catch (e) {
+                        console.error('Failed to clear caches:', e);
+                    }
+                }
+
+                console.log('✅ Legacy data clearing completed');
+
+            } catch (error) {
+                console.error('Error clearing legacy data:', error);
+                throw error;
+            }
+        }
+
+        // Initialize the Elm app
+        initDB().then(async () => {
+            // Run diagnostic test for Credentials API
+            console.log('Running Credentials API diagnostic test...');
+            const credentialsSupported = await testCredentialsAPI();
+            if (credentialsSupported) {
+                console.log('✓ Credentials API is working properly');
+            } else {
+                console.log('⚠ Credentials API has issues, will rely on localStorage fallback');
+            }
+
+            // Migrate existing GitHub configuration from IndexedDB to credentials store
+            await migrateGitHubConfigToCredentials();
+
+            // ==============================
+            // LEGACY SETUP DETECTION & CLEANUP
+            // TODO: Remove this section after legacy migration is complete
+            // ==============================
+            await detectAndClearLegacySetup();
+
+            var app = Elm.Main.init({
+                node: document.getElementById('app')
+            });
+
+            // Set up all port subscriptions IMMEDIATELY after app initialization
+            // This ensures they're ready when init commands are executed
+
+            // Handle save notes port
+            app.ports.saveNotes.subscribe(function (notes) {
+                saveNotesToDB(notes).catch(console.error);
+            });
+
+            // Handle load notes port
+            app.ports.loadNotes.subscribe(function () {
+                loadNotesFromDB()
+                    .then(notes => {
+                        app.ports.notesLoaded.send(notes);
+                    })
+                    .catch(console.error);
+            });
+
+            // Handle load notes for sync port (used after sync to merge tags)
+            app.ports.loadNotesForSync.subscribe(function () {
+                loadNotesFromDB(true)  // Mark as sync operation
+                    .then(notes => {
+                        app.ports.notesLoadedForSync.send(notes);
+                    })
+                    .catch(console.error);
+            });
+
+            // Handle save tags port
+            app.ports.saveTags.subscribe(function (tags) {
+                try {
+                    localStorage.setItem('notez-tags', JSON.stringify(tags));
+                } catch (error) {
+                    console.error('Failed to save tags:', error);
+                }
+            });
+
+            // Handle load tags port
+            app.ports.loadTags.subscribe(function () {
+                try {
+                    const tagsData = localStorage.getItem('notez-tags');
+                    const tags = tagsData ? JSON.parse(tagsData) : [];
+                    app.ports.tagsLoaded.send(tags);
+                } catch (error) {
+                    console.error('Failed to load tags:', error);
+                    app.ports.tagsLoaded.send([]);
+                }
+            });
+
+            // Handle save action count port
+            app.ports.saveActionCount.subscribe(function (count) {
+                try {
+                    localStorage.setItem('notez-action-count', JSON.stringify(count));
+                } catch (error) {
+                    console.error('Failed to save action count:', error);
+                }
+            });
+
+            // Handle load action count port
+            app.ports.loadActionCount.subscribe(function () {
+                try {
+                    const countData = localStorage.getItem('notez-action-count');
+                    const count = countData ? JSON.parse(countData) : 0;
+                    app.ports.actionCountLoaded.send(count);
+                } catch (error) {
+                    console.error('Failed to load action count:', error);
+                    app.ports.actionCountLoaded.send(0);
+                }
+            });
+
+            // Handle load action events port
+            app.ports.loadActionEvents.subscribe(function () {
+                try {
+                    const eventsData = localStorage.getItem('notez-action-events');
+                    const events = eventsData ? JSON.parse(eventsData) : [];
+                    app.ports.actionEventsLoaded.send(events);
+                } catch (error) {
+                    console.error('Failed to load action events:', error);
+                    app.ports.actionEventsLoaded.send([]);
+                }
+            });
+
+
+
+            // Handle action deduplication port
+            app.ports.deduplicateActions.subscribe(function (data) {
+                try {
+                    const actionEvent = data.actionEvent;
+                    const actionType = data.actionType;
+                    const noteId = data.noteId;
+
+                    // Get existing action events from localStorage
+                    const existingEvents = localStorage.getItem('notez-action-events');
+                    let events = existingEvents ? JSON.parse(existingEvents) : [];
+
+                    // Apply deduplication rules
+                    const originalEventCount = events.length;
+                    const deduplicatedEvents = deduplicateActionEvents(events, actionEvent, actionType, noteId);
+
+                    // Check if the action was blocked (deduplication function returned original events)
+                    if (deduplicatedEvents === events && actionType === 'updated') {
+                        // Action was blocked, don't add it and don't update localStorage
+                        console.log(`Action blocked: ${actionType} for note ${noteId}`);
+                        // Still send back the current events to keep Elm in sync
+                        app.ports.actionEventsLoaded.send(events);
+                        return;
+                    }
+
+                    events = deduplicatedEvents;
+
+                    // Add the new event (unless it was blocked)
+                    events.push(actionEvent);
+
+                    // Keep only the last 1000 events to prevent localStorage from growing too large
+                    if (events.length > 1000) {
+                        events.splice(0, events.length - 1000);
+                    }
+
+                    // Save back to localStorage
+                    localStorage.setItem('notez-action-events', JSON.stringify(events));
+
+                    // Send the updated events back to Elm to keep the model in sync
+                    app.ports.actionEventsLoaded.send(events);
+                } catch (error) {
+                    console.error('Failed to deduplicate and save action event:', error);
+                }
+            });
+
+            // Handle save GitHub config port
+            app.ports.saveGitHubConfig.subscribe(async function (config) {
+                try {
+                    console.log('Saving GitHub config:', {
+                        configType: typeof config,
+                        configKeys: config ? Object.keys(config) : 'no keys',
+                        repositoryUrl: config?.repositoryUrl || '[NOT SET]',
+                        hasToken: !!(config?.personalAccessToken),
+                        tokenLength: config?.personalAccessToken?.length || 0,
+                        enabled: config?.enabled,
+                        lastSyncTime: config?.lastSyncTime,
+                        lastSyncRef: config?.lastSyncRef || '[NOT SET]'
+                    });
+                    await saveGitHubConfigToCredentials(config);
+                    console.log('GitHub config saved successfully');
+                } catch (error) {
+                    console.error('Failed to save GitHub config:', error);
+                }
+            });
+
+            // Handle load GitHub config port
+            app.ports.loadGitHubConfig.subscribe(async function () {
+                try {
+                    console.log('Loading GitHub config...');
+                    const config = await loadGitHubConfigFromCredentials();
+                    console.log('Loaded GitHub config:', {
+                        configExists: !!config,
+                        configType: typeof config,
+                        configKeys: config ? Object.keys(config) : 'no keys',
+                        repositoryUrl: config?.repositoryUrl || '[NOT SET]',
+                        hasToken: !!(config?.personalAccessToken),
+                        tokenLength: config?.personalAccessToken?.length || 0,
+                        tokenIsEncrypted: isTokenEncrypted(config.personalAccessToken),
+                        enabled: config?.enabled,
+                        lastSyncTime: config?.lastSyncTime,
+                        lastSyncRef: config?.lastSyncRef || '[NOT SET]'
+                    });
+                    if (config) {
+                        app.ports.gitHubConfigLoaded.send(config);
+                    } else {
+                        // Send empty config if none exists
+                        console.log('No config found, sending empty config');
+                        app.ports.gitHubConfigLoaded.send({
+                            repositoryUrl: '',
+                            personalAccessToken: '',
+                            lastSyncTime: 0,
+                            lastSyncRef: '',
+                            enabled: false
+                        });
+                    }
+                } catch (error) {
+                    console.error('Failed to load GitHub config:', error);
+                    // Send empty config on error
+                    app.ports.gitHubConfigLoaded.send({
+                        repositoryUrl: '',
+                        personalAccessToken: '',
+                        lastSyncTime: 0,
+                        lastSyncRef: '',
+                        enabled: false
+                    });
+                }
+            });
+
+            // Handle GitHub sync port
+            app.ports.startGitHubSync.subscribe(function (syncData) {
+                console.log('Starting GitHub sync from Elm with sync data:', {
+                    syncDataType: typeof syncData,
+                    syncDataKeys: syncData ? Object.keys(syncData) : 'no keys',
+                    hasConfig: !!(syncData?.config),
+                    configType: typeof syncData?.config,
+                    configKeys: syncData?.config ? Object.keys(syncData.config) : 'no config keys',
+                    repositoryUrl: syncData?.config?.repositoryUrl || '[NOT SET]',
+                    hasActionEvents: !!(syncData?.actionEvents),
+                    actionEventsLength: syncData?.actionEvents?.length || 0
+                });
+                performGitHubSyncWithEvents(syncData)
+                    .then(async result => {
+                        console.log('GitHub sync completed successfully:', result);
+
+                        // Clear commit cache to prevent race conditions with background checks
+                        // This ensures the next background check gets fresh data from GitHub API
+                        try {
+                            await clearCachedCommitSha(syncData.config.repositoryUrl);
+                        } catch (cacheError) {
+                            console.warn('Failed to clear commit cache:', cacheError);
+                        }
+
+                        // Ensure we reload the notes after sync completion
+                        // This is critical for reflecting upstream changes in the Elm app
+                        try {
+                            // Wait for any ongoing transactions to complete
+                            await new Promise(resolve => setTimeout(resolve, 200));
+
+                            console.log('Loading notes after sync completion...');
+                            const notes = await loadNotesFromDB();
+                            console.log(`Sending ${notes.length} notes to Elm app after sync`);
+                            app.ports.notesLoaded.send(notes);
+
+                            // Notify Elm about updated notes so it can refresh the editor if needed
+                            if (result.updatedNoteIds && result.updatedNoteIds.length > 0) {
+                                console.log('📨 Notifying Elm about notes updated during sync');
+                                for (const noteId of result.updatedNoteIds) {
+                                    console.log(`📨 Notifying Elm that note ${noteId} was updated during sync`);
+                                    app.ports.noteUpdatedDuringSync.send({ noteId: noteId });
+                                }
+                            }
+
+                            // Send success message with commit SHA after notes are reloaded
+                            const syncResult = {
+                                message: result.message,
+                                commitSha: result.latestCommitSha || null
+                            };
+                            app.ports.syncCompleted.send({ tag: 'Ok', contents: JSON.stringify(syncResult) });
+                        } catch (error) {
+                            console.error('Failed to reload notes after sync:', error);
+                            app.ports.syncCompleted.send({ tag: 'Err', contents: 'Sync completed but failed to reload notes: ' + error.message });
+                        }
+                    })
+                    .catch(error => {
+                        console.error('GitHub sync failed:', error);
+
+                        // Check if this is an authentication or permission error
+                        if (error.message.includes('401') || error.message.includes('403') ||
+                            error.message.includes('Unauthorized') || error.message.includes('Forbidden') ||
+                            error.message.includes('Bad credentials') || error.message.includes('authentication')) {
+                            // Send authentication error through syncFailed port if available
+                            if (app.ports.syncFailed) {
+                                app.ports.syncFailed.send({
+                                    tag: 'Ok',
+                                    contents: JSON.stringify({
+                                        error: error.message,
+                                        type: 'authentication'
+                                    })
+                                });
+                            } else {
+                                // Fallback for older versions
+                                app.ports.syncCompleted.send({ tag: 'Err', contents: error.message });
+                            }
+                        } else {
+                            // Send other errors through syncCompleted port
+                            app.ports.syncCompleted.send({ tag: 'Err', contents: error.message });
+                        }
+                    });
+            });
+
+            // Handle GitHub force pull port
+            app.ports.forcePullFromGitHub.subscribe(function (encodedConfig) {
+                console.log('Starting force pull from GitHub...');
+
+                // Decode the config from Elm
+                let config;
+                try {
+                    config = JSON.parse(JSON.stringify(encodedConfig));
+                    console.log('Decoded config for force pull:', {
+                        repositoryUrl: config.repositoryUrl || '[NOT SET]',
+                        hasToken: !!(config.personalAccessToken),
+                        tokenLength: config.personalAccessToken?.length || 0,
+                        enabled: config.enabled
+                    });
+                } catch (error) {
+                    console.error('Failed to decode force pull config:', error);
+                    app.ports.syncCompleted.send({ tag: 'Err', contents: 'Failed to decode GitHub configuration for force pull' });
+                    return;
+                }
+
+                performForcePullFromGitHub(config)
+                    .then(async result => {
+                        console.log('Force pull completed successfully:', result);
+
+                        // Clear commit cache to prevent race conditions with background checks
+                        // This ensures the next background check gets fresh data from GitHub API
+                        try {
+                            await clearCachedCommitSha(config.repositoryUrl);
+                        } catch (cacheError) {
+                            console.warn('Failed to clear commit cache:', cacheError);
+                        }
+
+                        // Ensure we reload the notes after force pull completion
+                        try {
+                            // Wait for any ongoing transactions to complete
+                            await new Promise(resolve => setTimeout(resolve, 200));
+
+                            console.log('Loading notes after force pull completion...');
+                            const notes = await loadNotesFromDB();
+                            console.log(`Sending ${notes.length} notes to Elm app after force pull`);
+                            app.ports.notesLoaded.send(notes);
+
+                            // For force pull, all notes are potentially updated, so notify about all of them
+                            // This ensures the editor gets refreshed if the user was editing any note
+                            if (result.updatedNotes && result.updatedNotes.length > 0) {
+                                console.log('📨 Notifying Elm about all notes updated during force pull');
+                                for (const note of result.updatedNotes) {
+                                    app.ports.noteUpdatedDuringSync.send({ noteId: note.id });
+                                }
+                            }
+
+                            // Send success message after notes are reloaded
+                            const syncResult = {
+                                message: result.message,
+                                // Only include commit SHA if it's valid (force pull typically doesn't return one)
+                                commitSha: result.commitSha,
+                            };
+                            app.ports.syncCompleted.send({ tag: 'Ok', contents: JSON.stringify(syncResult) });
+
+                            // Send reset action count and empty events back to Elm to update the UI
+                            app.ports.actionCountLoaded.send(0);
+                            app.ports.actionEventsLoaded.send([]);
+                        } catch (error) {
+                            console.error('Failed to reload notes after force pull:', error);
+                            app.ports.syncCompleted.send({ tag: 'Err', contents: 'Force pull completed but failed to reload notes: ' + error.message });
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Force pull failed:', error);
+
+                        // Check if this is an authentication or permission error
+                        if (error.message.includes('401') || error.message.includes('403') ||
+                            error.message.includes('Unauthorized') || error.message.includes('Forbidden') ||
+                            error.message.includes('Bad credentials') || error.message.includes('authentication')) {
+                            // Send authentication error through syncFailed port if available
+                            if (app.ports.syncFailed) {
+                                app.ports.syncFailed.send({
+                                    tag: 'Ok',
+                                    contents: JSON.stringify({
+                                        error: error.message,
+                                        type: 'authentication'
+                                    })
+                                });
+                            } else {
+                                // Fallback for older versions
+                                app.ports.syncCompleted.send({ tag: 'Err', contents: error.message });
+                            }
+                        } else {
+                            // Send other errors through syncCompleted port
+                            app.ports.syncCompleted.send({ tag: 'Err', contents: error.message });
+                        }
+                    });
+            });
+
+            // Handle encryption port
+            app.ports.encryptWithPassphrase.subscribe(async function (data) {
+                try {
+                    const encryptedToken = await encryptText(data.text, data.passphrase);
+                    app.ports.encryptionCompleted.send({ success: true, result: encryptedToken });
+                } catch (error) {
+                    console.error('Encryption failed:', error);
+                    app.ports.encryptionCompleted.send({ success: false, error: error.message });
+                }
+            });
+
+            // Handle decryption port  
+            app.ports.decryptWithPassphrase.subscribe(async function (data) {
+                try {
+                    secureLog.log('Decryption port called with data:', {
+                        encryptedTextLength: data.encryptedText ? data.encryptedText.length : 'undefined',
+                        passphraseProvided: !!data.passphrase,
+                        passphraseLength: data.passphrase ? data.passphrase.length : 0,
+                        encryptedTextSample: data.encryptedText ? data.encryptedText.substring(0, 50) + '...' : 'undefined'
+                    });
+
+                    const decryptedToken = await decryptText(data.encryptedText, data.passphrase);
+                    secureLog.log('Decryption successful, token length:', decryptedToken.length);
+                    app.ports.decryptionCompleted.send({ success: true, result: decryptedToken });
+                } catch (error) {
+                    secureLog.error('Decryption failed:', error);
+                    secureLog.error('Decryption error details:', {
+                        message: error.message,
+                        stack: error.stack,
+                        encryptedDataType: typeof data.encryptedText,
+                        encryptedDataLength: data.encryptedText ? data.encryptedText.length : 'undefined',
+                        passphraseType: typeof data.passphrase,
+                        passphraseLength: data.passphrase ? data.passphrase.length : 'undefined'
+                    });
+                    app.ports.decryptionCompleted.send({ success: false, error: error.message });
+                }
+            });
+
+            // Handle clear action events port
+            app.ports.clearActionEvents.subscribe(function () {
+                try {
+                    console.log('Clearing action events and action count after successful sync');
+                    localStorage.removeItem('notez-action-events');
+                    localStorage.removeItem('notez-action-count');
+
+                    // Send the reset action count and empty events list back to Elm to update the UI
+                    app.ports.actionCountLoaded.send(0);
+                    app.ports.actionEventsLoaded.send([]);
+                } catch (error) {
+                    console.error('Failed to clear action events and count:', error);
+                }
+            });
+
+            // Handle save last open note port
+            app.ports.saveLastOpenNote.subscribe(function (noteId) {
+                try {
+                    localStorage.setItem('notez-last-open-note', JSON.stringify(noteId));
+                    console.log('Saved last open note ID:', noteId);
+                } catch (error) {
+                    console.error('Failed to save last open note:', error);
+                }
+            });
+
+            // Handle load last open note port
+            app.ports.loadLastOpenNote.subscribe(function () {
+                try {
+                    const lastOpenNoteData = localStorage.getItem('notez-last-open-note');
+                    if (lastOpenNoteData) {
+                        const noteId = JSON.parse(lastOpenNoteData);
+                        console.log('Loading last open note ID:', noteId);
+
+                        // Add a small delay to ensure notes are loaded first
+                        setTimeout(() => {
+                            app.ports.lastOpenNoteLoaded.send(noteId);
+                        }, 100);
+                    } else {
+                        console.log('No last open note found');
+                    }
+                } catch (error) {
+                    console.error('Failed to load last open note:', error);
+                }
+            });
+
+            // Handle save note history port
+            app.ports.saveNoteHistory.subscribe(function (historyData) {
+                try {
+                    localStorage.setItem('notez-note-history', JSON.stringify(historyData));
+                    console.log('Saved note history:', historyData);
+                } catch (error) {
+                    console.error('Failed to save note history:', error);
+                }
+            });
+
+            // Handle load note history port
+            app.ports.loadNoteHistory.subscribe(function () {
+                try {
+                    const historyData = localStorage.getItem('notez-note-history');
+                    if (historyData) {
+                        const history = JSON.parse(historyData);
+                        console.log('Loading note history:', history);
+                        app.ports.noteHistoryLoaded.send(history);
+                    } else {
+                        console.log('No note history found, starting with empty history');
+                        app.ports.noteHistoryLoaded.send({ noteHistory: [], historyIndex: 0 });
+                    }
+                } catch (error) {
+                    console.error('Failed to load note history:', error);
+                    // Send empty history on error
+                    app.ports.noteHistoryLoaded.send({ noteHistory: [], historyIndex: 0 });
+                }
+            });
+
+            // Handle clear mermaid diagrams port
+            app.ports.clearMermaidDiagrams.subscribe(function () {
+                console.log('Clearing mermaid diagrams via Elm port...');
+                clearMermaidDiagrams();
+            });
+
+            // Handle insert note link text port
+            app.ports.insertNoteLinkText.subscribe(function (noteTitle) {
+                console.log('Inserting note link text:', noteTitle);
+                insertTextAtCursor(noteTitle + ']]');
+            });
+
+            // Handle insert tab at cursor port
+            app.ports.insertTabAtCursor.subscribe(function (tabText) {
+                console.log('Inserting tab at cursor:', tabText);
+                insertTextAtCursor(tabText);
+            });
+
+            // Handle process markdown content port
+            app.ports.processMarkdownContent.subscribe(function () {
+                // Use immediate processing for port calls (user-initiated)
+                console.log('Processing markdown content via Elm port...');
+
+                // Add a very small delay to ensure DOM is updated
+                setTimeout(() => {
+                    processMarkdownContent();
+                }, 5);
+            });
+
+            // Handle clear all data port
+            app.ports.clearAllData.subscribe(async function () {
+                console.log('Clearing all data...');
+
+                try {
+                    // Clear IndexedDB
+                    if (db) {
+                        const transaction = db.transaction([STORE_NAME, CONFIG_STORE_NAME], 'readwrite');
+                        const notesStore = transaction.objectStore(STORE_NAME);
+                        const configStore = transaction.objectStore(CONFIG_STORE_NAME);
+
+                        await notesStore.clear();
+                        await configStore.clear();
+                    }
+
+                    // Clear localStorage
+                    localStorage.clear();
+
+                    // Clear sessionStorage
+                    sessionStorage.clear();
+
+                    // Clear any cached credentials
+                    if ('caches' in window) {
+                        const cacheNames = await caches.keys();
+                        await Promise.all(cacheNames.map(name => caches.delete(name)));
+                    }
+
+                    console.log('All data cleared successfully');
+                    app.ports.clearDataCompleted.send({ success: true, result: 'Data cleared successfully' });
+
+                } catch (error) {
+                    console.error('Error clearing data:', error);
+                    app.ports.clearDataCompleted.send({ success: false, error: error.message });
+                }
+            });
+
+            // Handle config export to clipboard
+            app.ports.exportGitHubConfig.subscribe(async function (config) {
+                try {
+                    const configJson = JSON.stringify(config, null, 2);
+
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        await navigator.clipboard.writeText(configJson);
+                        console.log('Configuration copied to clipboard');
+                        app.ports.configExported.send({ success: true, result: 'Configuration copied to clipboard' });
+                    } else {
+                        // Fallback for browsers without clipboard API
+                        const textArea = document.createElement('textarea');
+                        textArea.value = configJson;
+                        document.body.appendChild(textArea);
+                        textArea.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(textArea);
+                        console.log('Configuration copied to clipboard (fallback method)');
+                        app.ports.configExported.send({ success: true, result: 'Configuration copied to clipboard' });
+                    }
+                } catch (error) {
+                    console.error('Error copying configuration to clipboard:', error);
+                    app.ports.configExported.send({ success: false, error: error.message });
+                }
+            });            // Handle config import from JSON
+            app.ports.importGitHubConfig.subscribe(async function (configJson) {
+                try {
+                    const config = JSON.parse(configJson);
+
+                    // Validate the config structure
+                    if (!config.repositoryUrl || !config.personalAccessToken) {
+                        throw new Error('Invalid configuration: missing required fields (repositoryUrl or personalAccessToken)');
+                    }
+
+                    // Clean the config: remove sync history from imported configuration
+                    const cleanConfig = {
+                        repositoryUrl: config.repositoryUrl,
+                        personalAccessToken: config.personalAccessToken,
+                        enabled: config.enabled || false,
+                        lastSyncTime: 0, // Reset sync time for new instance
+                        lastSyncRef: '' // Reset sync ref for new instance
+                    };
+
+                    // Store the cleaned imported config using localStorage (same as other config storage)
+                    secureLocalStorageSetItem('notez-github-config', JSON.stringify(cleanConfig));
+                    console.log('Configuration imported successfully (sync history reset)');
+
+                    // Check if the token is encrypted and if config is enabled
+                    if (cleanConfig.enabled && isTokenEncrypted(cleanConfig.personalAccessToken)) {
+                        // Token is encrypted, we need to decrypt it first before force pull
+                        // Send success message and let Elm handle the force pull after loading config
+                        app.ports.configImported.send({ success: true, result: 'Configuration imported successfully. Force pull will be triggered after decryption.' });
+                    } else if (cleanConfig.enabled && !isTokenEncrypted(cleanConfig.personalAccessToken)) {
+                        // Token is not encrypted (shouldn't happen with proper configs, but handle gracefully)
+                        secureLog.log('Imported config has unencrypted token, triggering force pull...');
+
+                        try {
+                            const result = await performForcePullFromGitHub(cleanConfig);
+                            console.log('Auto force pull after import completed:', result);
+
+                            // Reload notes after force pull
+                            const notes = await loadNotesFromDB();
+                            app.ports.notesLoaded.send(notes);
+
+                            app.ports.configImported.send({ success: true, result: 'Configuration imported and notes synchronized successfully' });
+                        } catch (forcePullError) {
+                            console.error('Auto force pull after import failed:', forcePullError);
+                            app.ports.configImported.send({ success: true, result: 'Configuration imported but auto-sync failed: ' + forcePullError.message });
+                        }
+                    } else {
+                        // Config is disabled, just report success
+                        app.ports.configImported.send({ success: true, result: 'Configuration imported successfully' });
+                    }
+
+                } catch (error) {
+                    console.error('Error importing configuration:', error);
+                    let errorMessage = 'Invalid JSON format';
+                    if (error.message.includes('missing required fields')) {
+                        errorMessage = error.message;
+                    } else if (error instanceof SyntaxError) {
+                        errorMessage = 'Invalid JSON format: ' + error.message;
+                    } else {
+                        errorMessage = error.message;
+                    }
+                    app.ports.configImported.send({ success: false, error: errorMessage });
+                }
+            });
+
+            // Handle mobile viewport detection
+            app.ports.detectMobileViewport.subscribe(function () {
+                const isMobile = window.innerWidth <= 768;
+                app.ports.mobileViewportChanged.send(isMobile);
+            });
+
+            // Set up window resize listener for mobile viewport changes
+            let resizeTimeout;
+            window.addEventListener('resize', function () {
+                clearTimeout(resizeTimeout);
+                resizeTimeout = setTimeout(() => {
+                    const isMobile = window.innerWidth <= 768;
+                    app.ports.mobileViewportChanged.send(isMobile);
+                }, 100); // Debounce resize events
+            });
+
+            // Initial mobile detection
+            const initialIsMobile = window.innerWidth <= 768;
+            app.ports.mobileViewportChanged.send(initialIsMobile);
+
+            // Handle mobile notes browser open/close
+            app.ports.setMobileNotesBrowserOpen.subscribe(function (isOpen) {
+                if (isOpen) {
+                    document.body.classList.add('mobile-notes-browser-open');
+                } else {
+                    document.body.classList.remove('mobile-notes-browser-open');
+                }
+            });
+        }).catch(console.error);
+
+        // Enhanced Service Worker registration with PWA features
+        if ('serviceWorker' in navigator) {
+            let swRegistration = null;
+            let deferredPrompt = null;
+
+            window.addEventListener('load', function () {
+                // Register service worker
+                navigator.serviceWorker.register('/sw.js')
+                    .then(function (registration) {
+                        console.log('ServiceWorker registration successful');
+                        swRegistration = registration;
+                        
+                        // Check for updates
+                        checkForUpdates(registration);
+                        
+                        // Listen for service worker messages
+                        navigator.serviceWorker.addEventListener('message', function(event) {
+                            if (event.data && event.data.type === 'BACKGROUND_SYNC') {
+                                console.log('Background sync message received');
+                                // Handle background sync completion
+                            }
+                        });
+                    })
+                    .catch(function (err) {
+                        console.log('ServiceWorker registration failed: ', err);
+                    });
+            });
+
+            // Handle install prompt
+            window.addEventListener('beforeinstallprompt', function (e) {
+                console.log('Install prompt triggered');
+                e.preventDefault();
+                deferredPrompt = e;
+                
+                // Show install button or notification
+                showInstallPrompt();
+            });
+
+            // Handle successful installation
+            window.addEventListener('appinstalled', function (e) {
+                console.log('App installed successfully');
+                deferredPrompt = null;
+                hideInstallPrompt();
+            });
+
+            // Function to show install prompt
+            function showInstallPrompt() {
+                // Create install notification
+                const installNotification = document.createElement('div');
+                installNotification.id = 'install-notification';
+                installNotification.innerHTML = `
+                    <div style="
+                        position: fixed;
+                        top: 10px;
+                        right: 10px;
+                        background: #2196F3;
+                        color: white;
+                        padding: 15px;
+                        border-radius: 8px;
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+                        z-index: 1000;
+                        font-size: 14px;
+                        max-width: 300px;
+                    ">
+                        <div style="margin-bottom: 10px;">
+                            <strong>Install Notez</strong><br>
+                            Get the full app experience with offline access
+                        </div>
+                        <button id="install-button" style="
+                            background: white;
+                            color: #2196F3;
+                            border: none;
+                            padding: 8px 16px;
+                            border-radius: 4px;
+                            cursor: pointer;
+                            margin-right: 10px;
+                            font-weight: bold;
+                        ">Install</button>
+                        <button id="dismiss-install" style="
+                            background: transparent;
+                            color: white;
+                            border: 1px solid white;
+                            padding: 8px 16px;
+                            border-radius: 4px;
+                            cursor: pointer;
+                        ">Later</button>
+                    </div>
+                `;
+                
+                document.body.appendChild(installNotification);
+                
+                // Handle install button click
+                document.getElementById('install-button').addEventListener('click', function() {
+                    if (deferredPrompt) {
+                        deferredPrompt.prompt();
+                        deferredPrompt.userChoice.then(function(choiceResult) {
+                            if (choiceResult.outcome === 'accepted') {
+                                console.log('User accepted the install prompt');
+                            } else {
+                                console.log('User dismissed the install prompt');
+                            }
+                            deferredPrompt = null;
+                            hideInstallPrompt();
+                        });
+                    }
+                });
+                
+                // Handle dismiss button click
+                document.getElementById('dismiss-install').addEventListener('click', function() {
+                    hideInstallPrompt();
+                });
+            }
+
+            // Function to hide install prompt
+            function hideInstallPrompt() {
+                const notification = document.getElementById('install-notification');
+                if (notification) {
+                    notification.remove();
+                }
+            }
+
+            // Check for service worker updates
+            function checkForUpdates(registration) {
+                registration.addEventListener('updatefound', function() {
+                    const newWorker = registration.installing;
+                    
+                    newWorker.addEventListener('statechange', function() {
+                        if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                            // New service worker is ready
+                            showUpdateAvailable();
+                        }
+                    });
+                });
+            }
+
+            // Show update available notification
+            function showUpdateAvailable() {
+                const updateNotification = document.createElement('div');
+                updateNotification.id = 'update-notification';
+                updateNotification.innerHTML = `
+                    <div style="
+                        position: fixed;
+                        bottom: 10px;
+                        right: 10px;
+                        background: #4CAF50;
+                        color: white;
+                        padding: 15px;
+                        border-radius: 8px;
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+                        z-index: 1000;
+                        font-size: 14px;
+                        max-width: 300px;
+                    ">
+                        <div style="margin-bottom: 10px;">
+                            <strong>Update Available</strong><br>
+                            A new version of Notez is ready to install
+                        </div>
+                        <button id="update-button" style="
+                            background: white;
+                            color: #4CAF50;
+                            border: none;
+                            padding: 8px 16px;
+                            border-radius: 4px;
+                            cursor: pointer;
+                            margin-right: 10px;
+                            font-weight: bold;
+                        ">Update</button>
+                        <button id="dismiss-update" style="
+                            background: transparent;
+                            color: white;
+                            border: 1px solid white;
+                            padding: 8px 16px;
+                            border-radius: 4px;
+                            cursor: pointer;
+                        ">Later</button>
+                    </div>
+                `;
+                
+                document.body.appendChild(updateNotification);
+                
+                // Handle update button click
+                document.getElementById('update-button').addEventListener('click', function() {
+                    if (swRegistration && swRegistration.waiting) {
+                        swRegistration.waiting.postMessage({type: 'SKIP_WAITING'});
+                        window.location.reload();
+                    }
+                });
+                
+                // Handle dismiss button click
+                document.getElementById('dismiss-update').addEventListener('click', function() {
+                    const notification = document.getElementById('update-notification');
+                    if (notification) {
+                        notification.remove();
+                    }
+                });
+            }
+
+            // Handle network status changes
+            window.addEventListener('online', function() {
+                console.log('Network: Online');
+                // Optionally show online indicator
+            });
+
+            window.addEventListener('offline', function() {
+                console.log('Network: Offline');
+                // Optionally show offline indicator
+            });
+        }
+    </script>
+
+    <!-- Syntax highlighting library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/haskell.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/csharp.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/javascript.min.js"></script>
+
+    <!-- Mermaid diagrams library -->
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+
+    <!-- Initialize syntax highlighting and Mermaid -->
+    <script>
+        // Initialize Mermaid with better configuration
+        mermaid.initialize({
+            startOnLoad: false, // We'll handle initialization manually
+            theme: 'default',
+            securityLevel: 'loose',
+            fontFamily: 'inherit',
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true
+            }
+        });
+
+        // Initialize highlight.js
+        hljs.highlightAll();
+
+        // Function to reset code blocks to their original state (removes highlighting)
+        function resetCodeBlocks() {
+            // Try different selectors to find code blocks that might be highlighted
+            const selectors = [
+                '.code-block code',
+                'pre code',
+                'code[class*="language-"]',
+                'code[class*="lang-"]',
+                '.markdown-content pre code',
+                '.markdown-content code',
+                'code.hljs'  // specifically look for highlighted blocks
+            ];
+
+            let foundCodeBlocks = [];
+
+            for (const selector of selectors) {
+                const elements = document.querySelectorAll(selector);
+                if (elements.length > 0) {
+                    foundCodeBlocks = foundCodeBlocks.concat(Array.from(elements));
+                }
+            }
+
+            // Remove duplicates
+            foundCodeBlocks = [...new Set(foundCodeBlocks)];
+
+            console.log('Resetting', foundCodeBlocks.length, 'code blocks');
+
+            foundCodeBlocks.forEach((block) => {
+                // Check if this block has been highlighted and has preserved original data
+                const originalText = block.getAttribute('data-original-text') || block.textContent || block.innerText;
+                const originalClassName = block.getAttribute('data-original-class') ||
+                    block.className.replace(/\bhljs\b/g, '').replace(/\bhljs-\S+/g, '').trim();
+
+                // CRITICAL: Restore to simple text structure that Elm expects
+                // This prevents the replaceData error by ensuring only text nodes exist
+                block.innerHTML = ''; // Clear all child elements
+                block.textContent = originalText; // Set as simple text
+                block.className = originalClassName; // Restore original class
+
+                // Remove highlight.js data attributes
+                block.removeAttribute('data-highlighted');
+                // Keep our original data for future resets
+                // block.removeAttribute('data-original-text');
+                // block.removeAttribute('data-original-class');
+
+                console.log('Reset code block - restored to plain text:', originalText.substring(0, 30) + '...');
+            });
+        }
+
+        // Function to highlight code blocks (recreates content for clean state)
+        function highlightCodeBlocks() {
+            // Try different selectors to find code blocks
+            const selectors = [
+                '.code-block code',
+                'pre code',
+                'code[class*="language-"]',
+                'code[class*="lang-"]',
+                '.markdown-content pre code',
+                '.markdown-content code'
+            ];
+
+            let foundCodeBlocks = [];
+
+            for (const selector of selectors) {
+                const elements = document.querySelectorAll(selector);
+                if (elements.length > 0) {
+                    console.log(`Found ${elements.length} code blocks with selector: ${selector}`);
+                    foundCodeBlocks = foundCodeBlocks.concat(Array.from(elements));
+                }
+            }
+
+            // Remove duplicates
+            foundCodeBlocks = [...new Set(foundCodeBlocks)];
+
+            console.log('Total unique code blocks to highlight:', foundCodeBlocks.length);
+
+            foundCodeBlocks.forEach((block, index) => {
+                const originalText = block.textContent || block.innerText;
+                const originalClassName = block.className.replace(/\bhljs\b/g, '').replace(/\bhljs-\S+/g, '').trim();
+
+                console.log(`Processing code block ${index}:`, {
+                    hasText: !!originalText,
+                    className: originalClassName,
+                    parentTag: block.parentElement?.tagName,
+                    parentClass: block.parentElement?.className,
+                    textPreview: originalText?.substring(0, 50) + '...'
+                });
+
+                // Highlight if we have content
+                if (originalText && originalText.trim()) {
+                    console.log(`Highlighting code block ${index} with language:`, originalClassName || 'auto-detect');
+
+                    // CRITICAL: Store original text as data attribute before highlighting
+                    // This preserves the original content for Elm's virtual DOM
+                    block.setAttribute('data-original-text', originalText);
+                    if (originalClassName) {
+                        block.setAttribute('data-original-class', originalClassName);
+                    }
+
+                    // Apply highlighting - this will modify the DOM structure
+                    try {
+                        // Ensure clean className before highlighting
+                        block.className = originalClassName || '';
+
+                        hljs.highlightElement(block);
+                        console.log(`Successfully highlighted code block ${index}`);
+                    } catch (error) {
+                        console.error(`Error highlighting code block ${index}:`, error);
+                    }
+                } else {
+                    console.log(`Skipping code block ${index} - no content`);
+                }
+            });
+        }
+
+        // Function to render Mermaid diagrams after dynamic content changes
+        function renderMermaidDiagrams() {
+            // Clear all previous processing markers for re-rendering
+            const allMermaidElements = document.querySelectorAll('.mermaid-diagram[data-mermaid]');
+            console.log('Found', allMermaidElements.length, 'Mermaid diagrams to process');
+
+            allMermaidElements.forEach(async (element) => {
+                try {
+                    const mermaidCode = element.getAttribute('data-mermaid');
+                    const currentHash = element.getAttribute('data-content-hash');
+                    const processedHash = element.getAttribute('data-processed-hash');
+
+                    // Only re-render if content has actually changed
+                    if (processedHash && processedHash === currentHash) {
+                        console.log('Mermaid diagram unchanged, skipping re-render');
+                        return;
+                    }
+
+                    console.log('Processing Mermaid diagram:', mermaidCode.substring(0, 50) + '...');
+
+                    if (mermaidCode && mermaidCode.trim()) {
+                        // Clear the element and reset classes
+                        element.innerHTML = '';
+                        element.classList.add('mermaid');
+
+                        // Remove any previous processing markers to force re-rendering
+                        element.removeAttribute('data-processed');
+
+                        // Generate unique ID for this diagram
+                        const diagramId = 'mermaid-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+
+                        // Render the mermaid diagram
+                        const { svg } = await mermaid.render(diagramId, mermaidCode);
+                        element.innerHTML = svg;
+                        element.setAttribute('data-processed', 'true');
+                        element.setAttribute('data-processed-hash', currentHash);
+                        console.log('Successfully rendered Mermaid diagram with ID:', diagramId);
+                    }
+                } catch (error) {
+                    console.error('Mermaid rendering error:', error);
+                    element.innerHTML = '<p style="color: red; font-style: italic;">Error rendering diagram: ' + error.message + '</p>';
+                    element.setAttribute('data-processed', 'true');
+                    const currentHash = element.getAttribute('data-content-hash');
+                    element.setAttribute('data-processed-hash', currentHash);
+                }
+            });
+        }
+
+        // Function to clear all mermaid diagrams
+        function clearMermaidDiagrams() {
+            console.log('Clearing all existing mermaid diagrams...');
+
+            // Find all elements with mermaid-related classes or data attributes
+            const mermaidElements = document.querySelectorAll('.mermaid, .mermaid-diagram, [data-mermaid], [data-processed="true"]');
+
+            mermaidElements.forEach(element => {
+                // Clear the innerHTML to remove any rendered mermaid content
+                if (element.classList.contains('mermaid') || element.hasAttribute('data-processed')) {
+                    element.innerHTML = '';
+                }
+
+                // Remove mermaid-specific classes
+                element.classList.remove('mermaid');
+
+                // Remove processing attributes to allow fresh rendering
+                element.removeAttribute('data-processed');
+                element.removeAttribute('data-processed-hash');
+
+                console.log('Cleared mermaid diagram element:', element.className || element.tagName);
+            });
+
+            // Also clear any mermaid-specific DOM artifacts that might be left behind
+            // Mermaid sometimes creates additional elements in the DOM
+            const mermaidSvgs = document.querySelectorAll('svg[id^="mermaid-"]');
+            mermaidSvgs.forEach(svg => {
+                console.log('Removing orphaned mermaid SVG:', svg.id);
+                svg.remove();
+            });
+
+            console.log(`Cleared ${mermaidElements.length} mermaid elements and ${mermaidSvgs.length} orphaned SVGs`);
+        }
+
+        // Function to insert text at cursor position in the active textarea
+        function insertTextAtCursor(text) {
+            // Find the currently focused textarea or input, or default to note textarea
+            const activeElement = document.activeElement;
+            let targetElement = null;
+
+            if (activeElement && (activeElement.tagName === 'TEXTAREA' || activeElement.tagName === 'INPUT')) {
+                targetElement = activeElement;
+            } else {
+                // Fallback to note textarea if no textarea is focused
+                targetElement = document.querySelector('.note-textarea');
+            }
+
+            if (!targetElement) {
+                console.warn('No textarea found to insert text into');
+                return;
+            }
+
+            const startPos = targetElement.selectionStart;
+            const endPos = targetElement.selectionEnd;
+            const currentValue = targetElement.value;
+
+            // Insert the text at cursor position
+            const newValue = currentValue.substring(0, startPos) + text + currentValue.substring(endPos);
+            targetElement.value = newValue;
+
+            // Set cursor position after the inserted text
+            const newCursorPos = startPos + text.length;
+            targetElement.setSelectionRange(newCursorPos, newCursorPos);
+
+            // Focus the element and trigger input event so Elm gets notified
+            targetElement.focus();
+            targetElement.dispatchEvent(new Event('input', { bubbles: true }));
+
+            console.log('Inserted text at cursor:', text);
+        }
+
+        // Function to process all dynamic content
+        function processMarkdownContent() {
+            console.log('Processing markdown content...');
+
+            // CRITICAL: Clear all existing mermaid content first to prevent duplication
+            // This is essential because Elm's virtual DOM creates new elements, 
+            // but old rendered SVG content might still exist in the DOM
+            clearMermaidDiagrams();
+
+            // First, reset all code blocks to clean state
+            resetCodeBlocks();
+
+            // Debug: Check what elements actually exist in the DOM
+            const allCodeElements = document.querySelectorAll('code');
+            const preCodeElements = document.querySelectorAll('pre code');
+            const codeBlockElements = document.querySelectorAll('.code-block code');
+
+            console.log('DOM Debug - Found elements:');
+            console.log('- All code elements:', allCodeElements.length);
+            console.log('- pre > code elements:', preCodeElements.length);
+            console.log('- .code-block code elements:', codeBlockElements.length);
+
+            // Log actual structure
+            allCodeElements.forEach((el, i) => {
+                console.log(`Code element ${i}:`, {
+                    className: el.className,
+                    parentClassName: el.parentElement?.className,
+                    textContent: el.textContent?.substring(0, 50) + '...'
+                });
+            });
+
+            // Wait a brief moment for Elm's virtual DOM to update the content
+            // then highlight code blocks with fresh content
+            setTimeout(() => {
+                highlightCodeBlocks();
+                renderMermaidDiagrams();
+            }, 15); // Reduced timeout for better responsiveness
+        }
+
+        // Debounce function to prevent excessive processing
+        function debounce(func, wait) {
+            let timeout;
+            return function executedFunction(...args) {
+                const later = () => {
+                    clearTimeout(timeout);
+                    func(...args);
+                };
+                clearTimeout(timeout);
+                timeout = setTimeout(later, wait);
+            };
+        }
+
+        const debouncedProcess = debounce(processMarkdownContent, 50); // Reduced to 50ms for better responsiveness while avoiding excessive calls
+
+        // Set up a MutationObserver to watch for content changes
+        const observer = new MutationObserver((mutations) => {
+            let shouldProcess = false;
+            mutations.forEach((mutation) => {
+                if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+                    mutation.addedNodes.forEach((node) => {
+                        if (node.nodeType === 1) { // Element node
+                            if (node.classList && (
+                                node.classList.contains('markdown-content') ||
+                                node.classList.contains('markdown-preview-container') ||
+                                node.classList.contains('markdown-preview-pane') ||
+                                node.classList.contains('note-content-box')
+                            )) {
+                                shouldProcess = true;
+                            } else if (node.querySelector && (
+                                node.querySelector('.code-block') ||
+                                node.querySelector('.mermaid-diagram') ||
+                                node.querySelector('.markdown-content')
+                            )) {
+                                shouldProcess = true;
+                            }
+                        }
+                    });
+                } else if (mutation.type === 'attributes' &&
+                    mutation.target.classList &&
+                    mutation.target.classList.contains('markdown-content')) {
+                    shouldProcess = true;
+                }
+            });
+
+            if (shouldProcess) {
+                debouncedProcess();
+            }
+        });
+
+        // Start observing when the page is loaded
+        document.addEventListener('DOMContentLoaded', () => {
+            observer.observe(document.body, {
+                childList: true,
+                subtree: true
+            });
+
+            // Initial processing
+            processMarkdownContent();
+        });
+    </script>
+</body>
+
+</html>
