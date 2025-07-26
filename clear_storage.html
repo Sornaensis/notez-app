@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Clear Storage</title>
+</head>
+<body>
+    <h1>Clear Storage</h1>
+    <button onclick="clearAll()">Clear All LocalStorage</button>
+    <div id="output"></div>
+    
+    <script>
+        function clearAll() {
+            // Clear localStorage
+            localStorage.clear();
+            
+            // Clear IndexedDB
+            indexedDB.deleteDatabase('NotezDB');
+            
+            document.getElementById('output').innerHTML = '<p>Cleared localStorage and IndexedDB</p>';
+        }
+    </script>
+</body>
+</html>
